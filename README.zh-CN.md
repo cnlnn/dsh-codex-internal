@@ -2,46 +2,53 @@
 
 [English](README.md) | 简体中文
 
-这是一个用于 DeepSeek Harness 的轻量本地插件。它通过 OpenAI 官方 `@openai/codex-sdk` 注册真正的 `Codex` 模型提供方，让 DSH 的普通模型选择器直接使用当前 ChatGPT/Codex 订阅账号。
+把 ChatGPT/Codex 订阅接入 DeepSeek Harness，作为原生模型提供方使用。`Codex` 会直接出现在 DSH 标准模型选择器中，模型目录和推理强度来自当前登录账号。
 
-模型列表不是写死的。插件会读取当前 Codex 登录账号的可见模型目录，并为每个模型提供其实际支持的推理强度。
+这是社区集成项目，并非 OpenAI 或 DeepSeek 官方插件。
 
-插件不自行实现 OAuth，不读取或解析 Codex 凭据文件，也不接受 API Key。ChatGPT 订阅登录和令牌刷新完全由官方 Codex CLI 负责。启动 Codex 子进程时使用环境变量白名单，避免无关 API Key、代理凭据等敏感变量被继承。
+## 产品特性
 
-## 安全设计
+- DSH 标准模型选择器中的原生 `Codex` 提供方
+- 从当前 Codex 账号实时获取模型目录
+- 按模型展示可用推理强度
+- 在 `设置 → Models → Codex` 中添加自定义 Model ID
+- 普通对话直接使用 Codex，无需斜杠命令或中间模型转发
+- 原生接入 DSH 的文本、推理摘要、工具调用、结束状态和用量事件
+- 支持 Linux、macOS 和原生 Windows，覆盖 x64 与 arm64
 
-- 每次模型调用均以 Codex `read-only` 沙箱运行，使用 `approvalPolicy: never`，默认禁用网络。
-- DSH 的历史消息、系统指令和工具 Schema 会被投影为一个无状态 Codex 回合。
-- Codex 的结构化结果会映射回 DSH 的文本、推理摘要、工具调用和用量事件。
-- 插件明确要求 Codex 不使用自身的 Shell、文件系统、Web、MCP 或编辑工具；需要执行工具时，只向 DSH 返回工具调用，由 DSH 原有工具循环处理。
-- SDK 强制使用 `forced_login_method = "chatgpt"`，不会静默切换到 API Key 计费。
-- 运行时只依赖 OpenAI 官方 Codex 包，具体版本由 `package-lock.json` 锁定。
+## 接入方式
 
-## 系统要求
+插件使用 OpenAI 官方 `@openai/codex-sdk` 和 `@openai/codex`。ChatGPT 登录与令牌刷新由官方 Codex 运行时负责，插件本身不实现 OAuth，也不接收 API Key。
 
-- Linux、macOS 或原生 Windows
-- x64 或 arm64
-- Node.js 22.19 或更高版本
-- 已安装 DeepSeek Harness Web Profile
-- 运行 DSH 的同一系统用户已登录 Codex
+每次 DSH 请求会转换为一个无状态 Codex 回合。Codex 返回结构化文本、推理摘要和 DSH 工具调用，工具执行继续使用 DSH 原有工具循环。
 
-官方 Codex npm 包会根据操作系统和 CPU 架构安装对应的原生可执行文件。
+默认运行参数：
+
+| 项目 | 默认值 |
+| --- | --- |
+| Codex 登录方式 | `chatgpt` |
+| Codex 沙箱 | `read-only` |
+| 审批策略 | `never` |
+| Codex 网络访问 | 关闭 |
+| 子进程环境变量 | 白名单 |
+
+## 兼容性
+
+| 平台 | 架构 |
+| --- | --- |
+| Linux | x64、arm64 |
+| macOS | Intel x64、Apple silicon |
+| Windows | x64、arm64 |
+
+运行环境包括 Node.js 22.19+、DeepSeek Harness Web Profile，以及同一系统账号下的 Codex 登录。
 
 ## 安装
 
-首先确认 Codex 使用 ChatGPT 订阅登录：
+查看当前 Codex 登录状态：
 
 ```sh
 codex login status
 ```
-
-正常结果应包含：
-
-```text
-Logged in using ChatGPT
-```
-
-将本仓库安装到现有 DSH Web Profile。
 
 macOS/Linux：
 
@@ -51,7 +58,7 @@ dsh --profile web --dump-config
 dsh web
 ```
 
-Windows PowerShell，路径建议使用正斜杠，避免包地址解析歧义：
+Windows PowerShell：
 
 ```powershell
 dsh plugin --profile web add "link:C:/absolute/path/to/dsh-codex-internal"
@@ -59,19 +66,15 @@ dsh --profile web --dump-config
 dsh web
 ```
 
-如果平时通过 `npx` 启动 DSH，请使用同一个固定版本的 DSH 包执行插件安装和 Web Profile 启动命令。
+未全局安装 DSH 时，可以用固定版本的 `npx @deepseek-ai/dsh` 执行相同命令。
 
 ## 使用
 
-重启 DSH 后，在普通模型选择器中选择 `Codex` 提供方，再选择当前 Codex 账号可用的模型和推理强度。普通对话会直接走 Codex，不需要 `/codex` 命令，也不会经过 GLM 或其他模型转发。
+1. 打开 DSH 标准模型选择器。
+2. 选择 `Codex`、模型和推理强度。
+3. 发送普通消息。
 
-在 `设置 → Models → Codex → 模型目录` 中可以：
-
-- 使用 `获取可用模型` 刷新当前账号的模型目录。
-- 使用 `添加模型` 手工填写任意 Model ID。
-- 保存额外模型，或恢复使用 Codex 实时模型目录。
-
-手工填写的 Model ID 是否能够调用，最终仍由当前 ChatGPT/Codex 账号和官方服务决定。
+`设置 → Models` 中的 Codex 提供方卡片支持刷新实时目录和添加自定义 Model ID。自定义 ID 会按填写内容直接交给当前 Codex 账号处理。
 
 ## 卸载
 
@@ -79,18 +82,13 @@ dsh web
 dsh plugin --profile web remove @local/dsh-codex-internal
 ```
 
-卸载会从 DSH Web Profile 中移除依赖和 bundle，但不会删除：
+卸载后 Codex 提供方会从 DSH Web Profile 中移除。本地源码仓库、Codex 登录和 Codex 自有历史保持独立。
 
-- 本地 Git 源码仓库
-- Codex 的 ChatGPT 登录状态
-- Codex 自身的历史数据
-
-卸载后需要重启 DSH。已经打开的旧页面可能仍保留已加载的 JavaScript，刷新或关闭旧标签页即可；新启动页面不会再加载插件前端资源。
-
-可以使用以下命令确认组合配置中已不存在插件：
+## 开发
 
 ```sh
-dsh --profile web --dump-config
+npm ci
+npm test
 ```
 
-输出中不应再出现 `@local/dsh-codex-internal` 或 `codex-subscription-provider`。
+CI 使用 Node.js 22.19，覆盖 Ubuntu、macOS 和 Windows。

@@ -2,30 +2,53 @@
 
 English | [简体中文](README.zh-CN.md)
 
-Small, local DeepSeek Harness bundle that registers a `Codex` model provider backed by the official `@openai/codex-sdk` package. The DSH model selector reads the visible model catalog from the signed-in Codex account and exposes each model's supported reasoning efforts.
+Bring a ChatGPT-backed Codex subscription into DeepSeek Harness as a native model provider. Codex appears in the standard DSH model selector with the signed-in account's live model catalog and model-specific reasoning efforts.
 
-The bundle does not implement OAuth, read Codex credential files, or accept an API key. The official Codex CLI bundled by the SDK owns ChatGPT subscription authentication and token refresh. The child process receives an environment allowlist so unrelated API keys and proxy credentials are not inherited.
+This is a community integration and is not an official OpenAI or DeepSeek plugin.
 
-## Security model
+## Highlights
 
-- Every model call runs Codex in `read-only`, with `approvalPolicy: never`; network is disabled by default.
-- DSH history, system instructions, and tool schemas are projected into a stateless Codex turn. Structured Codex output is mapped back to DSH text, reasoning, tool calls, and usage.
-- The adapter tells Codex not to use its own internal tools. DSH tool requests are returned to the ordinary DSH tool loop instead.
-- The SDK forces `forced_login_method = "chatgpt"`; it cannot silently switch this bridge to API-key billing.
-- Results are exposed through DSH's ordinary text, reasoning, tool-call, finish, and token-usage stream.
-- Only official OpenAI packages are runtime dependencies. Versions are exact in `package-lock.json` after installation.
+- Native `Codex` provider in the DSH model selector
+- Live model discovery from the signed-in Codex account
+- Model-specific reasoning effort options
+- Custom Model ID support in `Settings → Models → Codex`
+- Direct DSH conversation flow with no slash command and no intermediary model
+- DSH-native text, reasoning, tool-call, finish, and usage events
+- Linux, macOS, and native Windows support on x64 and arm64
+
+## Integration
+
+The provider uses the official `@openai/codex-sdk` and `@openai/codex` packages. ChatGPT authentication and token refresh remain inside the official Codex runtime; the plugin neither implements OAuth nor accepts an API key.
+
+Each DSH request is projected into a stateless Codex turn. Codex returns structured text, reasoning summaries, and DSH tool calls, while tool execution stays in the existing DSH tool loop.
+
+Runtime defaults:
+
+| Setting | Value |
+| --- | --- |
+| Codex login method | `chatgpt` |
+| Codex sandbox | `read-only` |
+| Approval policy | `never` |
+| Codex network access | Disabled |
+| Child-process environment | Allowlisted |
+
+## Compatibility
+
+| Platform | Architectures |
+| --- | --- |
+| Linux | x64, arm64 |
+| macOS | Intel x64, Apple silicon |
+| Windows | x64, arm64 |
+
+Requirements: Node.js 22.19+, a DeepSeek Harness Web profile, and a Codex login owned by the same system account that runs DSH.
 
 ## Install
 
-The provider supports Linux, macOS, and native Windows on x64 and arm64. It requires Node.js 22.19 or newer, a DeepSeek Harness Web profile, and a Codex login on the same user account that runs DSH. The official Codex package supplies the matching native binary for each platform.
-
-Confirm the official Codex login uses the ChatGPT subscription:
+Check the active Codex login:
 
 ```sh
 codex login status
 ```
-
-Install this checkout into the existing Web profile:
 
 macOS/Linux:
 
@@ -35,7 +58,7 @@ dsh --profile web --dump-config
 dsh web
 ```
 
-Windows PowerShell (forward slashes avoid package-specifier ambiguity):
+Windows PowerShell:
 
 ```powershell
 dsh plugin --profile web add "link:C:/absolute/path/to/dsh-codex-internal"
@@ -43,13 +66,15 @@ dsh --profile web --dump-config
 dsh web
 ```
 
-If DSH is normally launched with `npx`, use the same pinned DSH package to run the plugin command and Web profile.
+The same commands work with a pinned `npx @deepseek-ai/dsh` launcher when DSH is not installed globally.
 
 ## Use
 
-Restart DSH, open the normal model selector, choose the `Codex` provider, then select any model currently advertised by Codex and its reasoning effort. Ordinary messages use that route directly; no `/codex` command and no GLM delegation are involved.
+1. Open the standard DSH model selector.
+2. Select `Codex`, a model, and its reasoning effort.
+3. Send a regular message.
 
-The Models settings page includes a Codex model-catalog editor. `获取可用模型` reads the current account catalog, and `添加模型` accepts an arbitrary model id. Saved custom rows are added to the live Codex catalog; whether an arbitrary id can run is still decided by the signed-in Codex account.
+The Codex provider card under `Settings → Models` also offers live catalog refresh and custom Model ID entries. Custom IDs are passed to the signed-in Codex account as entered.
 
 ## Remove
 
@@ -57,4 +82,13 @@ The Models settings page includes a Codex model-catalog editor. `获取可用模
 dsh plugin --profile web remove @local/dsh-codex-internal
 ```
 
-Removal withdraws the dependency and bundle from the DSH Web profile. It does not delete this source checkout, Codex login state, or Codex thread history. Restart DSH after removal; a browser tab that was already open should also be refreshed or closed.
+Removal detaches the provider from the DSH Web profile. The source checkout, Codex login, and Codex-owned history remain separate.
+
+## Development
+
+```sh
+npm ci
+npm test
+```
+
+The CI matrix runs on Ubuntu, macOS, and Windows with Node.js 22.19.
