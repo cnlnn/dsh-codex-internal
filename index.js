@@ -64,6 +64,10 @@ const REASONING_CAPABILITIES = new Map([
   ['gpt-5.3-codex-spark', { efforts: ['low', 'medium', 'high', 'xhigh'], defaultEffort: 'high' }],
 ])
 
+// The account catalog can briefly advertise this API model even though the
+// ChatGPT-authenticated Codex endpoint rejects it categorically.
+const UNSUPPORTED_CHATGPT_MODELS = new Set(['gpt-5.2'])
+
 const catalogModel = z.object({
   id: z.string().required(),
   name: z.string(),
@@ -366,7 +370,9 @@ export function discoverCodexCatalog(signal, spawnProcess = spawn) {
               ? { defaultEffort: row.defaultReasoningEffort }
               : {}),
           }))
-          .filter(model => model.id.length > 0 && model.id !== 'undefined')
+          .filter(model => model.id.length > 0
+            && model.id !== 'undefined'
+            && !UNSUPPORTED_CHATGPT_MODELS.has(model.id))
         finish(undefined, models)
         return
       }

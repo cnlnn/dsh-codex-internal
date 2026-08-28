@@ -1,12 +1,47 @@
 import assert from 'node:assert/strict'
+import { EventEmitter } from 'node:events'
+import { PassThrough } from 'node:stream'
 import test from 'node:test'
 import {
   buildCodexPrompt,
   CODEX_PROVIDER,
   CodexSubscriptionAdapter,
+  discoverCodexCatalog,
   mapUsage,
   sanitizedEnvironment,
 } from '../index.js'
+
+test('account discovery drops hidden and ChatGPT-incompatible catalog rows', async () => {
+  const child = new EventEmitter()
+  child.stdout = new PassThrough()
+  child.stderr = new PassThrough()
+  child.kill = () => true
+  child.stdin = {
+    write(line) {
+      const request = JSON.parse(line)
+      queueMicrotask(() => {
+        if (request.id === 1) {
+          child.stdout.write(`${JSON.stringify({ id: 1, result: {} })}\n`)
+        } else {
+          child.stdout.write(`${JSON.stringify({
+            id: 2,
+            result: {
+              data: [
+                { model: 'gpt-5.6-sol', displayName: 'Sol', hidden: false },
+                { model: 'gpt-5.2', displayName: 'Unsupported', hidden: false },
+                { model: 'gpt-reserve', displayName: 'Hidden', hidden: true },
+              ],
+            },
+          })}\n`)
+        }
+      })
+      return true
+    },
+  }
+
+  const models = await discoverCodexCatalog(undefined, () => child)
+  assert.deepEqual(models.map(model => model.id), ['gpt-5.6-sol'])
+})
 
 test('sanitizedEnvironment excludes ambient credentials', () => {
   assert.deepEqual(sanitizedEnvironment({
