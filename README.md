@@ -1,5 +1,7 @@
 # DSH Codex Subscription Provider
 
+English | [简体中文](README.zh-CN.md)
+
 Small, local DeepSeek Harness bundle that registers a `Codex` model provider backed by the official `@openai/codex-sdk` package. The DSH model selector reads the visible model catalog from the signed-in Codex account and exposes each model's supported reasoning efforts.
 
 The bundle does not implement OAuth, read Codex credential files, or accept an API key. The official Codex CLI bundled by the SDK owns ChatGPT subscription authentication and token refresh. The child process receives an environment allowlist so unrelated API keys and proxy credentials are not inherited.
@@ -55,4 +57,4 @@ The Models settings page includes a Codex model-catalog editor. `获取可用模
 dsh plugin --profile web remove @local/dsh-codex-internal
 ```
 
-Removal deletes the profile link and bundle layer. It does not delete Codex login state or Codex thread history because those remain owned by the official Codex CLI.
+Removal withdraws the dependency and bundle from the DSH Web profile. It does not delete this source checkout, Codex login state, or Codex thread history. Restart DSH after removal; a browser tab that was already open should also be refreshed or closed.
