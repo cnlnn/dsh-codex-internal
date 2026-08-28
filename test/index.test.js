@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
+import { readFile } from 'node:fs/promises'
 import { PassThrough } from 'node:stream'
 import test from 'node:test'
 import {
@@ -9,8 +10,19 @@ import {
   CodexSubscriptionAdapter,
   discoverCodexCatalog,
   mapUsage,
+  partialJsonString,
   sanitizedEnvironment,
 } from '../index.js'
+
+function streamedEvents(parts, usage = null) {
+  return (async function * () {
+    for (const text of parts) {
+      yield { type: 'item.updated', item: { type: 'agent_message', id: 'message-1', text } }
+    }
+    yield { type: 'item.completed', item: { type: 'agent_message', id: 'message-1', text: parts.at(-1) } }
+    yield { type: 'turn.completed', usage }
+  })()
+}
 
 test('account discovery drops hidden and ChatGPT-incompatible catalog rows', async () => {
   const child = new EventEmitter()
@@ -101,7 +113,14 @@ test('adapter advertises every visible Codex account model and its reasoning eff
 
 test('adapter adds configured custom model ids without rejecting them', async () => {
   const adapter = new CodexSubscriptionAdapter(
-    { models: [{ id: 'my-codex-model', name: 'My Codex Model' }] },
+    { models: [{
+      id: 'my-codex-model',
+      name: 'My Codex Model',
+      contextWindow: 200_000,
+      maxTokens: 20_000,
+      efforts: ['low', 'high'],
+      defaultEffort: 'high',
+    }] },
     () => assert.fail('client must stay lazy'),
     async () => [{ id: 'gpt-5.6-luna', name: 'GPT-5.6-Luna', efforts: [], defaultEffort: 'medium' }],
   )
@@ -111,6 +130,23 @@ test('adapter adds configured custom model ids without rejecting them', async ()
   ])
   const custom = await adapter.resolveModel(CODEX_PROVIDER, 'my-codex-model')
   assert.equal(custom.name, 'My Codex Model')
+  assert.equal(custom.context.contextWindow, 200_000)
+  assert.equal(custom.defaultMaxTokens, 20_000)
+  assert.deepEqual(custom.reasoning.efforts.map(effort => effort.id), ['low', 'high'])
+  assert.equal(custom.reasoning.defaultEffort, 'high')
+})
+
+test('partialJsonString decodes streamed JSON string prefixes', () => {
+  assert.deepEqual(partialJsonString('{"reasoning":"line\\npar', 'reasoning'), {
+    found: true,
+    complete: false,
+    value: 'line\npar',
+  })
+  assert.deepEqual(partialJsonString('{"reasoning":"done","text":"ok"}', 'reasoning'), {
+    found: true,
+    complete: true,
+    value: 'done',
+  })
 })
 
 test('buildCodexPrompt carries the DSH system, history, and tool schemas', () => {
@@ -151,18 +187,21 @@ test('adapter streams text and forwards the selected Codex model', async () => {
     startThread(options) {
       calls.push(options)
       return {
-        async run(prompt, turnOptions) {
+        async runStreamed(prompt, turnOptions) {
           calls.push({ prompt, turnOptions })
+          const finalResponse = JSON.stringify({ reasoning: 'brief', text: 'done', tool_calls: [] })
           return {
-            finalResponse: JSON.stringify({ reasoning: 'brief', text: 'done', tool_calls: [] }),
-            usage: {
+            events: streamedEvents([
+              '{"reasoning":"br',
+              '{"reasoning":"brief","text":"do',
+              finalResponse,
+            ], {
               input_tokens: 10,
               cached_input_tokens: 2,
               cache_write_input_tokens: 0,
               output_tokens: 3,
               reasoning_output_tokens: 1,
-            },
-            items: [],
+            }),
           }
         },
       }
@@ -185,22 +224,24 @@ test('adapter streams text and forwards the selected Codex model', async () => {
   assert.equal(calls[0].networkAccessEnabled, false)
   assert.equal(calls[1].turnOptions.signal, signal)
   assert.deepEqual(chunks.at(-1), { type: 'finish', reason: { kind: 'stop' } })
-  assert.ok(chunks.some(chunk => chunk.type === 'text-delta' && chunk.text === 'done'))
+  assert.deepEqual(chunks.filter(chunk => chunk.type === 'text-delta').map(chunk => chunk.text), ['do', 'ne'])
+  assert.deepEqual(chunks.filter(chunk => chunk.type === 'reasoning-delta').map(chunk => chunk.text), ['br', 'ief'])
+  assert.ok(chunks.findIndex(chunk => chunk.type === 'block-end' && chunk.block.type === 'reasoning')
+    < chunks.findIndex(chunk => chunk.type === 'block-start' && chunk.blockType === 'text'))
 })
 
 test('adapter converts structured Codex requests into DSH tool calls', async () => {
   const adapter = new CodexSubscriptionAdapter({}, () => ({
     startThread() {
       return {
-        async run() {
+        async runStreamed() {
+          const finalResponse = JSON.stringify({
+            reasoning: '',
+            text: '',
+            tool_calls: [{ id: 'call-1', name: 'read', arguments_json: '{"path":"README.md"}' }],
+          })
           return {
-            finalResponse: JSON.stringify({
-              reasoning: '',
-              text: '',
-              tool_calls: [{ id: 'call-1', name: 'read', arguments_json: '{"path":"README.md"}' }],
-            }),
-            usage: null,
-            items: [],
+            events: streamedEvents([finalResponse]),
           }
         },
       }
@@ -217,4 +258,13 @@ test('adapter converts structured Codex requests into DSH tool calls', async () 
     && chunk.block.type === 'tool-call'
     && chunk.block.arguments === '{"path":"README.md"}'))
   assert.deepEqual(chunks.at(-1), { type: 'finish', reason: { kind: 'tool-calls' } })
+})
+
+test('client exposes Codex model controls in plugin configuration', async () => {
+  const client = await readFile(new URL('../lib/client.js', import.meta.url), 'utf8')
+  assert.match(client, /settings\.plugin\.item/)
+  assert.match(client, /const inject = \["slots", "connection"\]/)
+  assert.match(client, /上下文窗口/)
+  assert.match(client, /默认推理强度/)
+  assert.match(client, /api\.llm\.discoverModels/)
 })

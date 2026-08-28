@@ -11,7 +11,8 @@ This is a community integration and is not an official OpenAI or DeepSeek plugin
 - Native `Codex` provider in the DSH model selector
 - Live model discovery from the signed-in Codex account
 - Model-specific reasoning effort options
-- Custom Model ID support in `Settings → Models → Codex`
+- Incremental text and reasoning-summary streaming with cancellation
+- Custom Model IDs, reasoning efforts, context windows, and output limits in `Settings → Plugins → Plugin Configuration → Codex`
 - Direct DSH conversation flow with no slash command and no intermediary model
 - DSH-native text, reasoning, tool-call, finish, and usage events
 - Linux, macOS, and native Windows support on x64 and arm64
@@ -74,7 +75,7 @@ The same commands work with a pinned `npx @deepseek-ai/dsh` launcher when DSH is
 2. Select `Codex`, a model, and its reasoning effort.
 3. Send a regular message.
 
-The Codex provider card under `Settings → Models` also offers live catalog refresh and custom Model ID entries. Custom IDs are passed to the signed-in Codex account as entered.
+The Codex card under `Settings → Plugins → Plugin Configuration → Codex` offers live catalog refresh and custom Model ID entries. Custom models can also declare reasoning efforts, a default effort, a context window, and an output limit. Custom IDs are passed to the signed-in Codex account as entered. All model settings are available in the UI; editing `settings.yaml` is not required.
 
 ## Remove
 

@@ -76,6 +76,8 @@ const catalogModel = z.object({
   description: z.string(),
   contextWindow: z.number().step(1).min(1),
   maxTokens: z.number().step(1).min(1),
+  efforts: z.array(z.string()),
+  defaultEffort: z.string(),
 })
 
 export const Config = z.object({
@@ -184,12 +186,19 @@ function resolveCatalog(models) {
     if (id.length === 0) throw new Error('Codex model ids must be non-empty.')
     if (seen.has(id)) throw new Error(`Codex model id "${id}" is duplicated.`)
     seen.add(id)
+    const efforts = [...new Set((model.efforts ?? []).map(effort => effort.trim()).filter(Boolean))]
+    const defaultEffort = model.defaultEffort?.trim()
+    if (defaultEffort !== undefined && defaultEffort.length > 0 && !efforts.includes(defaultEffort)) {
+      efforts.push(defaultEffort)
+    }
     return {
       ...model,
       id,
       ...(model.name === undefined || model.name.trim().length === 0
         ? {}
         : { name: model.name.trim() }),
+      ...(efforts.length === 0 ? {} : { efforts }),
+      ...(defaultEffort === undefined || defaultEffort.length === 0 ? {} : { defaultEffort }),
     }
   })
 }
@@ -209,6 +218,16 @@ function resolvedModelInfo(provider, model, capability) {
     ...(model.maxTokens === undefined ? {} : { defaultMaxTokens: model.maxTokens }),
     ...(capability === undefined ? {} : { reasoning: reasoningInfo(capability) }),
   }
+}
+
+function modelCapability(model) {
+  if (Array.isArray(model?.efforts) && model.efforts.length > 0) {
+    return {
+      efforts: model.efforts,
+      defaultEffort: model.defaultEffort ?? model.efforts[0],
+    }
+  }
+  return REASONING_CAPABILITIES.get(model?.id)
 }
 
 function serializeBlock(block) {
@@ -278,6 +297,42 @@ function parseStructuredResponse(text) {
     throw new LlmError('Codex returned an invalid structured model response.', 'PROTOCOL')
   }
   return value
+}
+
+/** Decode the usable prefix of one JSON string field from partial structured output. */
+export function partialJsonString(text, key) {
+  const match = new RegExp(`"${key}"\\s*:\\s*"`).exec(text)
+  if (match === null) return { found: false, complete: false, value: '' }
+  const start = match.index + match[0].length
+  let escaped = false
+  let end = text.length
+  let complete = false
+  for (let index = start; index < text.length; index += 1) {
+    const character = text[index]
+    if (escaped) {
+      escaped = false
+      continue
+    }
+    if (character === '\\') {
+      escaped = true
+      continue
+    }
+    if (character === '"') {
+      end = index
+      complete = true
+      break
+    }
+  }
+
+  let raw = text.slice(start, end)
+  while (raw.length > 0) {
+    try {
+      return { found: true, complete, value: JSON.parse(`"${raw}"`) }
+    } catch {
+      raw = raw.slice(0, -1)
+    }
+  }
+  return { found: true, complete, value: '' }
 }
 
 export function mapUsage(usage) {
@@ -490,7 +545,7 @@ export class CodexSubscriptionAdapter extends LlmAdapter {
     const model = live.find(candidate => candidate.id === modelId)
       ?? this.options().models.find(candidate => candidate.id === modelId)
       ?? { id: modelId, name: modelId }
-    return resolvedModelInfo(provider, model, REASONING_CAPABILITIES.get(modelId))
+    return resolvedModelInfo(provider, model, modelCapability(model))
   }
 
   async * stream(options) {
@@ -513,9 +568,9 @@ export class CodexSubscriptionAdapter extends LlmAdapter {
       threadSource: 'dsh-llm-adapter',
     })
 
-    let turn
+    let streamed
     try {
-      turn = await thread.run(buildCodexPrompt(options), {
+      streamed = await thread.runStreamed(buildCodexPrompt(options), {
         outputSchema: RESPONSE_SCHEMA,
         signal: options.signal,
       })
@@ -523,24 +578,94 @@ export class CodexSubscriptionAdapter extends LlmAdapter {
       throw classifySdkError(error)
     }
 
-    const response = parseStructuredResponse(turn.finalResponse)
-    let index = 0
+    let finalResponse = ''
+    let usage
+    let reasoning = ''
+    let visibleText = ''
+    let reasoningStarted = false
+    let textStarted = false
+    let reasoningEnded = false
+    let textEnded = false
+    let reasoningIndex
+    let textIndex
+    let nextIndex = 0
 
-    if (response.reasoning.length > 0) {
-      const block = { type: 'reasoning', text: response.reasoning }
-      yield { type: 'block-start', index, blockType: 'reasoning' }
-      yield { type: 'reasoning-delta', index, text: response.reasoning }
-      yield { type: 'block-end', index, block }
-      index += 1
+    try {
+      for await (const event of streamed.events) {
+        if ((event.type === 'item.updated' || event.type === 'item.completed')
+          && event.item?.type === 'agent_message') {
+          finalResponse = event.item.text
+          const reasoningField = partialJsonString(finalResponse, 'reasoning')
+          const textField = partialJsonString(finalResponse, 'text')
+          const nextReasoning = reasoningField.value
+          const nextText = textField.value
+          if (nextReasoning.length > reasoning.length) {
+            if (!reasoningStarted) {
+              reasoningStarted = true
+              reasoningIndex = nextIndex
+              nextIndex += 1
+              yield { type: 'block-start', index: reasoningIndex, blockType: 'reasoning' }
+            }
+            yield { type: 'reasoning-delta', index: reasoningIndex, text: nextReasoning.slice(reasoning.length) }
+            reasoning = nextReasoning
+          }
+          if (reasoningStarted && !reasoningEnded && reasoningField.complete) {
+            reasoningEnded = true
+            yield { type: 'block-end', index: reasoningIndex, block: { type: 'reasoning', text: reasoning } }
+          }
+          if (nextText.length > visibleText.length) {
+            if (!textStarted) {
+              textStarted = true
+              textIndex = nextIndex
+              nextIndex += 1
+              yield { type: 'block-start', index: textIndex, blockType: 'text' }
+            }
+            yield { type: 'text-delta', index: textIndex, text: nextText.slice(visibleText.length) }
+            visibleText = nextText
+          }
+          if (textStarted && !textEnded && textField.complete) {
+            textEnded = true
+            yield { type: 'block-end', index: textIndex, block: { type: 'text', text: visibleText } }
+          }
+        } else if (event.type === 'turn.completed') {
+          usage = event.usage
+        } else if (event.type === 'turn.failed') {
+          throw new Error(event.error?.message ?? 'Codex turn failed.')
+        } else if (event.type === 'error') {
+          throw new Error(event.message)
+        }
+      }
+    } catch (error) {
+      throw classifySdkError(error)
     }
 
-    if (response.text.length > 0) {
-      const block = { type: 'text', text: response.text }
-      yield { type: 'block-start', index, blockType: 'text' }
-      yield { type: 'text-delta', index, text: response.text }
-      yield { type: 'block-end', index, block }
-      index += 1
+    const response = parseStructuredResponse(finalResponse)
+    if (response.reasoning.length > reasoning.length) {
+      if (!reasoningStarted) {
+        reasoningStarted = true
+        reasoningIndex = nextIndex
+        nextIndex += 1
+        yield { type: 'block-start', index: reasoningIndex, blockType: 'reasoning' }
+      }
+      yield { type: 'reasoning-delta', index: reasoningIndex, text: response.reasoning.slice(reasoning.length) }
     }
+    if (response.text.length > visibleText.length) {
+      if (!textStarted) {
+        textStarted = true
+        textIndex = nextIndex
+        nextIndex += 1
+        yield { type: 'block-start', index: textIndex, blockType: 'text' }
+      }
+      yield { type: 'text-delta', index: textIndex, text: response.text.slice(visibleText.length) }
+    }
+    if (reasoningStarted && !reasoningEnded) {
+      yield { type: 'block-end', index: reasoningIndex, block: { type: 'reasoning', text: response.reasoning } }
+    }
+    if (textStarted && !textEnded) {
+      yield { type: 'block-end', index: textIndex, block: { type: 'text', text: response.text } }
+    }
+
+    let index = nextIndex
 
     for (const call of response.tool_calls) {
       if (call === null || typeof call !== 'object' || Array.isArray(call)
@@ -574,8 +699,8 @@ export class CodexSubscriptionAdapter extends LlmAdapter {
       index += 1
     }
 
-    const usage = mapUsage(turn.usage)
-    if (usage !== undefined) yield { type: 'usage', usage }
+    const mappedUsage = mapUsage(usage ?? null)
+    if (mappedUsage !== undefined) yield { type: 'usage', usage: mappedUsage }
     yield {
       type: 'finish',
       reason: response.tool_calls.length > 0 ? { kind: 'tool-calls' } : { kind: 'stop' },
@@ -603,5 +728,6 @@ export function apply(ctx, config) {
     setSource: (source) => {
       current = source
     },
+    onChange() {},
   })
 }
