@@ -15,6 +15,8 @@ The bundle does not implement OAuth, read Codex credential files, or accept an A
 
 ## Install
 
+The provider supports Linux, macOS, and native Windows on x64 and arm64. It requires Node.js 22.19 or newer, a DeepSeek Harness Web profile, and a Codex login on the same user account that runs DSH. The official Codex package supplies the matching native binary for each platform.
+
 Confirm the official Codex login uses the ChatGPT subscription:
 
 ```sh
@@ -23,8 +25,18 @@ codex login status
 
 Install this checkout into the existing Web profile:
 
+macOS/Linux:
+
 ```sh
 dsh plugin --profile web add link:/absolute/path/to/dsh-codex-internal
+dsh --profile web --dump-config
+dsh web
+```
+
+Windows PowerShell (forward slashes avoid package-specifier ambiguity):
+
+```powershell
+dsh plugin --profile web add "link:C:/absolute/path/to/dsh-codex-internal"
 dsh --profile web --dump-config
 dsh web
 ```

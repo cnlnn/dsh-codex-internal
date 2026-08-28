@@ -4,6 +4,7 @@ import { PassThrough } from 'node:stream'
 import test from 'node:test'
 import {
   buildCodexPrompt,
+  CODEX_CLI_PATH,
   CODEX_PROVIDER,
   CodexSubscriptionAdapter,
   discoverCodexCatalog,
@@ -39,20 +40,28 @@ test('account discovery drops hidden and ChatGPT-incompatible catalog rows', asy
     },
   }
 
-  const models = await discoverCodexCatalog(undefined, () => child)
+  const models = await discoverCodexCatalog(undefined, (command, args) => {
+    assert.equal(command, process.execPath)
+    assert.equal(args[0], CODEX_CLI_PATH)
+    return child
+  })
   assert.deepEqual(models.map(model => model.id), ['gpt-5.6-sol'])
 })
 
 test('sanitizedEnvironment excludes ambient credentials', () => {
   assert.deepEqual(sanitizedEnvironment({
     HOME: '/home/test',
-    PATH: '/bin',
+    Path: 'C:\\Windows\\System32',
+    USERPROFILE: 'C:\\Users\\test',
+    SystemRoot: 'C:\\Windows',
     OPENAI_API_KEY: 'secret',
     DEEPSEEK_API_KEY: 'secret',
     HTTPS_PROXY: 'http://user:pass@example.test',
   }), {
     HOME: '/home/test',
-    PATH: '/bin',
+    Path: 'C:\\Windows\\System32',
+    USERPROFILE: 'C:\\Users\\test',
+    SystemRoot: 'C:\\Windows',
   })
 })
 

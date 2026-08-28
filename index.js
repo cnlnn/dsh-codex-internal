@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
+import { createRequire } from 'node:module'
 import { homedir } from 'node:os'
 import z from '@deepseek-ai/schemastery'
 import {
@@ -15,6 +16,7 @@ export const name = 'llm-codex-subscription'
 export const inject = ['llm']
 export const CODEX_PROVIDER = 'codex'
 export const CODEX_SETTINGS_NAMESPACE = settingsNamespace('llm-codex-subscription')
+export const CODEX_CLI_PATH = createRequire(import.meta.url).resolve('@openai/codex/bin/codex.js')
 
 export const DEFAULT_MODELS = [
   {
@@ -83,20 +85,34 @@ export const Config = z.object({
 })
 
 const SAFE_ENV_KEYS = new Set([
+  'APPDATA',
   'CODEX_CA_CERTIFICATE',
   'CODEX_HOME',
+  'COMSPEC',
   'DBUS_SESSION_BUS_ADDRESS',
   'HOME',
+  'HOMEDRIVE',
+  'HOMEPATH',
   'LANG',
   'LC_ALL',
   'LC_CTYPE',
   'LOGNAME',
+  'LOCALAPPDATA',
   'PATH',
+  'PATHEXT',
+  'PROGRAMDATA',
+  'PROGRAMFILES',
+  'PROGRAMFILES(X86)',
   'SHELL',
   'SSL_CERT_FILE',
+  'SYSTEMROOT',
+  'TEMP',
   'TERM',
+  'TMP',
   'TMPDIR',
   'USER',
+  'USERPROFILE',
+  'WINDIR',
   'XDG_CACHE_HOME',
   'XDG_CONFIG_HOME',
   'XDG_DATA_HOME',
@@ -138,7 +154,7 @@ const RESPONSE_SCHEMA = {
 /** Return only values required by the official Codex CLI process. */
 export function sanitizedEnvironment(source = process.env) {
   return Object.fromEntries(
-    Object.entries(source).filter(([key, value]) => SAFE_ENV_KEYS.has(key) && value !== undefined),
+    Object.entries(source).filter(([key, value]) => SAFE_ENV_KEYS.has(key.toUpperCase()) && value !== undefined),
   )
 }
 
@@ -294,7 +310,8 @@ export function discoverCodexCatalog(signal, spawnProcess = spawn) {
       return
     }
 
-    const child = spawnProcess('codex', [
+    const child = spawnProcess(process.execPath, [
+      CODEX_CLI_PATH,
       'app-server',
       '--stdio',
       '-c',
