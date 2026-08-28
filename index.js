@@ -711,14 +711,6 @@ export class CodexSubscriptionAdapter extends LlmAdapter {
 export function apply(ctx, config) {
   let current = () => config
   const adapter = new CodexSubscriptionAdapter(() => current())
-  ctx.llm.registerConfigurableProviders([
-    {
-      provider: CODEX_PROVIDER,
-      displayName: 'Codex',
-      settingsNs: CODEX_SETTINGS_NAMESPACE,
-      settingsPath: [],
-    },
-  ])
   ctx.llm.registerModelDiscovery(
     CODEX_SETTINGS_NAMESPACE,
     (_request, signal) => discoverCodexModels(signal),

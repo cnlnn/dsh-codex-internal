@@ -262,9 +262,13 @@ test('adapter converts structured Codex requests into DSH tool calls', async () 
 
 test('client exposes Codex model controls in plugin configuration', async () => {
   const client = await readFile(new URL('../lib/client.js', import.meta.url), 'utf8')
+  const server = await readFile(new URL('../index.js', import.meta.url), 'utf8')
   assert.match(client, /settings\.plugin\.item/)
   assert.match(client, /const inject = \["slots", "connection"\]/)
+  assert.match(client, /工作目录/)
+  assert.match(client, /允许 Codex 访问网络/)
   assert.match(client, /上下文窗口/)
   assert.match(client, /默认推理强度/)
   assert.match(client, /api\.llm\.discoverModels/)
+  assert.doesNotMatch(server, /registerConfigurableProviders/)
 })
