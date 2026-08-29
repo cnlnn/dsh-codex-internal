@@ -11,6 +11,7 @@ import {
   discoverCodexCatalog,
   mapUsage,
   partialJsonString,
+  readCodexRateLimits,
   sanitizedEnvironment,
 } from '../index.js'
 
@@ -75,6 +76,48 @@ test('sanitizedEnvironment excludes ambient credentials', () => {
     USERPROFILE: 'C:\\Users\\test',
     SystemRoot: 'C:\\Windows',
   })
+})
+
+test('quota lookup exposes rate-limit windows without account identity', async () => {
+  const child = new EventEmitter()
+  child.stdout = new PassThrough()
+  child.stderr = new PassThrough()
+  child.kill = () => true
+  child.stdin = {
+    write(line) {
+      const request = JSON.parse(line)
+      queueMicrotask(() => {
+        child.stdout.write(`${JSON.stringify(request.id === 1
+          ? { id: 1, result: {} }
+          : {
+              id: 2,
+              result: {
+                rateLimits: null,
+                rateLimitsByLimitId: {
+                  codex: {
+                    limitId: 'codex',
+                    primary: { usedPercent: 36, windowDurationMins: 10_080, resetsAt: 1_788_452_814 },
+                    secondary: null,
+                    credits: { hasCredits: false, unlimited: false, balance: '0' },
+                    planType: 'pro',
+                  },
+                },
+                rateLimitResetCredits: { availableCount: 0, credits: [] },
+                email: 'must-not-leak@example.test',
+              },
+            })}\n`)
+      })
+      return true
+    },
+  }
+
+  const quota = await readCodexRateLimits(undefined, () => child)
+  assert.equal(quota.buckets[0].name, 'Codex')
+  assert.equal(quota.buckets[0].planType, 'pro')
+  assert.equal(quota.buckets[0].primary.usedPercent, 36)
+  assert.equal(quota.buckets[0].primary.windowDurationMins, 10_080)
+  assert.equal(quota.resetCredits, 0)
+  assert.equal(JSON.stringify(quota).includes('must-not-leak'), false)
 })
 
 test('adapter advertises every visible Codex account model and its reasoning efforts', async () => {
@@ -270,5 +313,7 @@ test('client exposes Codex model controls in plugin configuration', async () => 
   assert.match(client, /上下文窗口/)
   assert.match(client, /默认推理强度/)
   assert.match(client, /api\.llm\.discoverModels/)
+  assert.match(client, /Codex 额度/)
+  assert.match(client, /API_ROOT.*quota/s)
   assert.doesNotMatch(server, /registerConfigurableProviders/)
 })

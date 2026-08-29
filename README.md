@@ -11,6 +11,7 @@ This is a community integration and is not an official OpenAI or DeepSeek plugin
 - Native `Codex` provider in the DSH model selector
 - Live model discovery from the signed-in Codex account
 - Model-specific reasoning effort options
+- Current Codex rolling limits, remaining percentages, and reset times
 - Incremental text and reasoning-summary streaming with cancellation
 - Working directory, network access, custom Model IDs, reasoning efforts, context windows, and output limits in `Settings → Plugins → Plugin Configuration → Codex`
 - Direct DSH conversation flow with no slash command and no intermediary model
@@ -19,7 +20,7 @@ This is a community integration and is not an official OpenAI or DeepSeek plugin
 
 ## Integration
 
-The provider uses the official `@openai/codex-sdk` and `@openai/codex` packages. ChatGPT authentication and token refresh remain inside the official Codex runtime; the plugin neither implements OAuth nor accepts an API key.
+The provider uses the official `@openai/codex-sdk` and `@openai/codex` packages. ChatGPT authentication, token refresh, model discovery, and quota lookup remain inside the official Codex runtime; the plugin neither implements OAuth nor accepts an API key.
 
 Each DSH request is projected into a stateless Codex turn. Codex returns structured text, reasoning summaries, and DSH tool calls, while tool execution stays in the existing DSH tool loop.
 

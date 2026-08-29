@@ -13,10 +13,11 @@ import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-sett
 import { Codex } from '@openai/codex-sdk'
 
 export const name = 'llm-codex-subscription'
-export const inject = ['llm']
+export const inject = ['llm', 'webServer']
 export const CODEX_PROVIDER = 'codex'
 export const CODEX_SETTINGS_NAMESPACE = settingsNamespace('llm-codex-subscription')
 export const CODEX_CLI_PATH = createRequire(import.meta.url).resolve('@openai/codex/bin/codex.js')
+const API_ROOT = '/plugins/@local/dsh-codex-internal/api'
 
 export const DEFAULT_MODELS = [
   {
@@ -357,11 +358,16 @@ function classifySdkError(error) {
   return new LlmError(message, 'CODEX_SDK', { cause: error })
 }
 
-/** Read the full visible catalog exposed to the signed-in Codex account. */
-export function discoverCodexCatalog(signal, spawnProcess = spawn) {
+function codexAppServerRequest(method, params, {
+  signal,
+  spawnProcess = spawn,
+  timeoutMs = 30_000,
+  label = 'request',
+  code = 'CODEX_APP_SERVER',
+} = {}) {
   return new Promise((resolve, reject) => {
     if (signal?.aborted === true) {
-      reject(new LlmError('Codex model discovery was aborted.', 'ABORTED'))
+      reject(new LlmError(`Codex ${label} was aborted.`, 'ABORTED'))
       return
     }
 
@@ -388,19 +394,19 @@ export function discoverCodexCatalog(signal, spawnProcess = spawn) {
       if (error === undefined) resolve(models)
       else reject(error)
     }
-    const abort = () => finish(new LlmError('Codex model discovery was aborted.', 'ABORTED'))
-    const fail = (message, cause) => finish(new LlmError(message, 'CODEX_DISCOVERY', { cause }))
+    const abort = () => finish(new LlmError(`Codex ${label} was aborted.`, 'ABORTED'))
+    const fail = (message, cause) => finish(new LlmError(message, code, { cause }))
     const write = value => child.stdin.write(`${JSON.stringify(value)}\n`)
-    const timer = setTimeout(() => fail('Codex model discovery timed out.'), 30_000)
+    const timer = setTimeout(() => fail(`Codex ${label} timed out.`), timeoutMs)
 
     signal?.addEventListener('abort', abort, { once: true })
-    child.on('error', error => fail(`Unable to start Codex model discovery: ${error.message}`, error))
+    child.on('error', error => fail(`Unable to start Codex ${label}: ${error.message}`, error))
     child.stderr.setEncoding('utf8')
     child.stderr.on('data', (chunk) => {
       stderr = `${stderr}${chunk}`.slice(-4_000)
     })
     child.on('exit', (code) => {
-      if (!settled) fail(`Codex model discovery exited with code ${String(code)}.${stderr.length > 0 ? ` ${stderr.trim()}` : ''}`)
+      if (!settled) fail(`Codex ${label} exited with code ${String(code)}.${stderr.length > 0 ? ` ${stderr.trim()}` : ''}`)
     })
     child.stdout.setEncoding('utf8')
     child.stdout.on('data', (chunk) => {
@@ -418,34 +424,15 @@ export function discoverCodexCatalog(signal, spawnProcess = spawn) {
           continue
         }
         if (message.id === 1 && message.result !== undefined) {
-          write({ id: 2, method: 'model/list', params: { includeHidden: false, limit: 100 } })
+          write({ id: 2, method, params })
           continue
         }
         if (message.id !== 2) continue
         if (message.error !== undefined) {
-          fail(`Codex rejected model discovery: ${message.error.message ?? 'unknown error'}`)
+          fail(`Codex rejected ${label}: ${message.error.message ?? 'unknown error'}`)
           return
         }
-        const rows = Array.isArray(message.result?.data) ? message.result.data : []
-        const models = rows
-          .filter(row => row !== null && typeof row === 'object' && row.hidden !== true)
-          .map(row => ({
-            id: String(row.model ?? row.id),
-            name: typeof row.displayName === 'string' ? row.displayName : String(row.model ?? row.id),
-            ...(typeof row.description === 'string' ? { description: row.description } : {}),
-            efforts: Array.isArray(row.supportedReasoningEfforts)
-              ? row.supportedReasoningEfforts
-                .map(item => item?.reasoningEffort)
-                .filter(effort => typeof effort === 'string')
-              : [],
-            ...(typeof row.defaultReasoningEffort === 'string'
-              ? { defaultEffort: row.defaultReasoningEffort }
-              : {}),
-          }))
-          .filter(model => model.id.length > 0
-            && model.id !== 'undefined'
-            && !UNSUPPORTED_CHATGPT_MODELS.has(model.id))
-        finish(undefined, models)
+        finish(undefined, message.result)
         return
       }
     })
@@ -461,10 +448,138 @@ export function discoverCodexCatalog(signal, spawnProcess = spawn) {
   })
 }
 
+/** Read the full visible catalog exposed to the signed-in Codex account. */
+export async function discoverCodexCatalog(signal, spawnProcess = spawn) {
+  const result = await codexAppServerRequest('model/list', { includeHidden: false, limit: 100 }, {
+    signal,
+    spawnProcess,
+    label: 'model discovery',
+    code: 'CODEX_DISCOVERY',
+  })
+  const rows = Array.isArray(result?.data) ? result.data : []
+  return rows
+    .filter(row => row !== null && typeof row === 'object' && row.hidden !== true)
+    .map(row => ({
+      id: String(row.model ?? row.id),
+      name: typeof row.displayName === 'string' ? row.displayName : String(row.model ?? row.id),
+      ...(typeof row.description === 'string' ? { description: row.description } : {}),
+      efforts: Array.isArray(row.supportedReasoningEfforts)
+        ? row.supportedReasoningEfforts
+          .map(item => item?.reasoningEffort)
+          .filter(effort => typeof effort === 'string')
+        : [],
+      ...(typeof row.defaultReasoningEffort === 'string'
+        ? { defaultEffort: row.defaultReasoningEffort }
+        : {}),
+    }))
+    .filter(model => model.id.length > 0
+      && model.id !== 'undefined'
+      && !UNSUPPORTED_CHATGPT_MODELS.has(model.id))
+}
+
 /** Return discovery candidates in DSH's public model-list shape. */
 export async function discoverCodexModels(signal, spawnProcess = spawn) {
   const catalog = await discoverCodexCatalog(signal, spawnProcess)
   return catalog.map(model => ({ id: model.id, name: model.name }))
+}
+
+function quotaWindow(value) {
+  if (value === null || typeof value !== 'object') return null
+  const usedPercent = Number(value.usedPercent)
+  if (!Number.isFinite(usedPercent)) return null
+  return {
+    usedPercent: Math.max(0, Math.min(100, usedPercent)),
+    windowDurationMins: Number.isFinite(Number(value.windowDurationMins))
+      ? Number(value.windowDurationMins)
+      : null,
+    resetsAt: Number.isFinite(Number(value.resetsAt)) ? Number(value.resetsAt) : null,
+  }
+}
+
+function quotaBucket(value, fallbackId) {
+  if (value === null || typeof value !== 'object') return null
+  const id = typeof value.limitId === 'string' && value.limitId.length > 0
+    ? value.limitId
+    : fallbackId
+  if (id.length === 0) return null
+  const credits = value.credits !== null && typeof value.credits === 'object'
+    ? {
+        hasCredits: value.credits.hasCredits === true,
+        unlimited: value.credits.unlimited === true,
+        balance: typeof value.credits.balance === 'string' ? value.credits.balance : null,
+      }
+    : null
+  return {
+    id,
+    name: typeof value.limitName === 'string' && value.limitName.length > 0
+      ? value.limitName
+      : id === 'codex' ? 'Codex' : id,
+    planType: typeof value.planType === 'string' ? value.planType : null,
+    primary: quotaWindow(value.primary),
+    secondary: quotaWindow(value.secondary),
+    credits,
+    rateLimitReachedType: typeof value.rateLimitReachedType === 'string'
+      ? value.rateLimitReachedType
+      : null,
+  }
+}
+
+/** Read account rate-limit windows without exposing account identity or auth data. */
+export async function readCodexRateLimits(signal, spawnProcess = spawn) {
+  const result = await codexAppServerRequest('account/rateLimits/read', undefined, {
+    signal,
+    spawnProcess,
+    timeoutMs: 15_000,
+    label: 'quota lookup',
+    code: 'CODEX_QUOTA',
+  })
+  const rows = result?.rateLimitsByLimitId !== null
+    && typeof result?.rateLimitsByLimitId === 'object'
+    ? Object.entries(result.rateLimitsByLimitId)
+    : []
+  const buckets = rows
+    .map(([id, value]) => quotaBucket(value, id))
+    .filter(Boolean)
+    .sort((left, right) => Number(right.id === 'codex') - Number(left.id === 'codex'))
+  if (buckets.length === 0) {
+    const fallback = quotaBucket(result?.rateLimits, 'codex')
+    if (fallback !== null) buckets.push(fallback)
+  }
+  return {
+    buckets,
+    resetCredits: Number.isFinite(Number(result?.rateLimitResetCredits?.availableCount))
+      ? Number(result.rateLimitResetCredits.availableCount)
+      : null,
+    fetchedAt: new Date().toISOString(),
+  }
+}
+
+function json(res, status, value) {
+  const body = JSON.stringify(value)
+  res.writeHead(status, {
+    'cache-control': 'no-store',
+    'content-length': Buffer.byteLength(body),
+    'content-type': 'application/json; charset=utf-8',
+  })
+  res.end(body)
+}
+
+function registerQuotaRoute(ctx) {
+  return ctx.webServer.register({
+    kind: 'exact',
+    path: `${API_ROOT}/quota`,
+    async handler(req, res) {
+      if (req.method !== 'GET') {
+        json(res, 405, { ok: false, error: 'method not allowed' })
+        return
+      }
+      try {
+        json(res, 200, { ok: true, value: await readCodexRateLimits() })
+      } catch (error) {
+        json(res, 502, { ok: false, error: error instanceof Error ? error.message : String(error) })
+      }
+    },
+  })
 }
 
 /** DSH provider adapter backed only by the official Codex SDK and ChatGPT login. */
@@ -711,6 +826,7 @@ export class CodexSubscriptionAdapter extends LlmAdapter {
 export function apply(ctx, config) {
   let current = () => config
   const adapter = new CodexSubscriptionAdapter(() => current())
+  registerQuotaRoute(ctx)
   ctx.llm.registerModelDiscovery(
     CODEX_SETTINGS_NAMESPACE,
     (_request, signal) => discoverCodexModels(signal),

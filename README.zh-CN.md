@@ -11,6 +11,7 @@
 - DSH 标准模型选择器中的原生 `Codex` 提供方
 - 从当前 Codex 账号实时获取模型目录
 - 按模型展示可用推理强度
+- 显示当前 Codex 账号的滚动额度、剩余比例和重置时间
 - 实时增量输出文本与推理摘要，支持中止当前生成
 - 在 `设置 → 插件 → 插件配置 → Codex` 中设置工作目录、网络访问、自定义 Model ID、推理强度、上下文窗口和最大输出
 - 普通对话直接使用 Codex，无需斜杠命令或中间模型转发
@@ -19,7 +20,7 @@
 
 ## 接入方式
 
-插件使用 OpenAI 官方 `@openai/codex-sdk` 和 `@openai/codex`。ChatGPT 登录与令牌刷新由官方 Codex 运行时负责，插件本身不实现 OAuth，也不接收 API Key。
+插件使用 OpenAI 官方 `@openai/codex-sdk` 和 `@openai/codex`。ChatGPT 登录、令牌刷新、模型目录和额度读取均由官方 Codex 运行时负责，插件本身不实现 OAuth，也不接收 API Key。
 
 每次 DSH 请求会转换为一个无状态 Codex 回合。Codex 返回结构化文本、推理摘要和 DSH 工具调用，工具执行继续使用 DSH 原有工具循环。
 
