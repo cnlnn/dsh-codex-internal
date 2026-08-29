@@ -315,5 +315,8 @@ test('client exposes Codex model controls in plugin configuration', async () => 
   assert.match(client, /api\.llm\.discoverModels/)
   assert.match(client, /Codex 额度/)
   assert.match(client, /API_ROOT.*quota/s)
+  const saveBody = client.slice(client.indexOf('const save = async'), client.indexOf('const reset = async'))
+  assert.equal(saveBody.match(/\bconst models\b/g)?.length, 1)
+  assert.match(saveBody, /const persistedModels/)
   assert.doesNotMatch(server, /registerConfigurableProviders/)
 })
