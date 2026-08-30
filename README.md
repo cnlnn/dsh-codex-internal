@@ -16,6 +16,7 @@ This is a community integration and is not an official OpenAI or DeepSeek plugin
 - Working directory, network access, custom Model IDs, reasoning efforts, context windows, and output limits in `Settings → Plugins → Plugin Configuration → Codex`
 - Direct DSH conversation flow with no slash command and no intermediary model
 - DSH-native text, reasoning, tool-call, finish, and usage events
+- Automatic DSH compaction uses a conservative adapter budget; oversized histories are sent as complete, ordered input segments through isolated, hierarchical passes, while summary quality depends on the model
 - Linux, macOS, and native Windows support on x64 and arm64
 
 ## Integration
@@ -23,6 +24,8 @@ This is a community integration and is not an official OpenAI or DeepSeek plugin
 The provider uses the official `@openai/codex-sdk` and `@openai/codex` packages. ChatGPT authentication, token refresh, model discovery, and quota lookup remain inside the official Codex runtime; the plugin neither implements OAuth nor accepts an API key.
 
 Each active DSH session reuses one in-memory Codex thread while its complete request history remains append-only. The adapter sends only newly appended history after the first turn, so Codex can reuse its prompt cache. A missing session id, concurrent call (`SESSION_BUSY`), retry after failure, history edit/fork, or model, reasoning, and runtime option change starts an isolated thread or explicit failure path. Auxiliary `session-title` and `compaction` calls bypass the main pool; compaction invalidates the main session lineage first. Thread state is not persisted by the plugin. Codex returns structured text, reasoning summaries, and DSH tool calls, while tool execution stays in the existing DSH tool loop.
+
+The adapter reports a conservative 256,000-token context budget to DSH when Codex does not publish capacity. When a complete compaction prompt exceeds the 900,000-character safe SDK budget, the input is segmented at message and block boundaries and every segment is sent in order through isolated intermediate passes, including ordered slices for oversized text and tool results. The model determines summary quality; only the final summary is exposed to DSH, and all intermediate usage is combined into one usage event.
 
 Runtime defaults:
 

@@ -1,20 +1,32 @@
 import assert from 'node:assert/strict'
-import { EventEmitter } from 'node:events'
+import { EventEmitter, getEventListeners } from 'node:events'
 import { readFile } from 'node:fs/promises'
 import { PassThrough } from 'node:stream'
 import test from 'node:test'
+import { Codex } from '@openai/codex-sdk'
+import { Context } from '@deepseek-ai/cordis'
+import { LlmRuntime } from '@deepseek-ai/dsh-llm'
 import {
   buildCodexPrompt,
+  buildCompactionPrompt,
   CODEX_CLI_PATH,
+  CODEX_ADAPTER_CONTEXT_WINDOW,
+  CODEX_COMPACTION_MAX_CALLS,
+  CODEX_COMPACTION_MAX_CALLS_PER_LEVEL,
+  CODEX_SAFE_PROMPT_CHAR_BUDGET,
   CODEX_PROVIDER,
   CodexSubscriptionAdapter,
   CodexThreadPool,
   codexAssistantFingerprint,
+  classifySdkError,
   discoverCodexCatalog,
   mapUsage,
+  packCompactionFragments,
+  prepareSegmentedCompaction,
   partialJsonString,
   readCodexRateLimits,
   sanitizedEnvironment,
+  splitCompactionSource,
 } from '../index.js'
 
 function streamedEvents(parts, usage = null) {
@@ -30,6 +42,12 @@ function streamedEvents(parts, usage = null) {
 async function collectStream(adapter, options) {
   const chunks = []
   for await (const chunk of adapter.stream(options)) chunks.push(chunk)
+  return chunks
+}
+
+async function collectIterable(iterable) {
+  const chunks = []
+  for await (const chunk of iterable) chunks.push(chunk)
   return chunks
 }
 
@@ -75,6 +93,7 @@ test('account discovery drops hidden and ChatGPT-incompatible catalog rows', asy
     return child
   })
   assert.deepEqual(models.map(model => model.id), ['gpt-5.6-sol'])
+  assert.equal(models[0].contextWindow, CODEX_ADAPTER_CONTEXT_WINDOW)
 })
 
 test('sanitizedEnvironment excludes ambient credentials', () => {
@@ -195,6 +214,299 @@ test('adapter adds configured custom model ids without rejecting them', async ()
   assert.equal(custom.reasoning.defaultEffort, 'high')
 })
 
+test('adapter merges explicit metadata over live rows and always exposes context capacity', async () => {
+  const adapter = new CodexSubscriptionAdapter(
+    { models: [{
+      id: 'gpt-5.6-sol',
+      name: 'Pinned Sol',
+      contextWindow: 123_456,
+      maxTokens: 7_000,
+    }] },
+    () => assert.fail('client must stay lazy'),
+    async () => [{
+      id: 'gpt-5.6-sol',
+      name: 'Live Sol',
+      efforts: ['low', 'high'],
+      defaultEffort: 'high',
+    }, {
+      id: 'gpt-dynamic',
+      name: 'Dynamic',
+      efforts: ['medium'],
+      defaultEffort: 'medium',
+    }],
+  )
+
+  const sol = await adapter.resolveModel(CODEX_PROVIDER, 'gpt-5.6-sol')
+  assert.equal(sol.name, 'Pinned Sol')
+  assert.equal(sol.context.contextWindow, 123_456)
+  assert.equal(sol.defaultMaxTokens, 7_000)
+  assert.deepEqual(sol.reasoning.efforts.map(effort => effort.id), ['low', 'high'])
+  assert.equal((await adapter.resolveModel(CODEX_PROVIDER, 'gpt-dynamic')).context.contextWindow,
+    CODEX_ADAPTER_CONTEXT_WINDOW)
+  assert.equal((await adapter.resolveModel(CODEX_PROVIDER, 'unknown-model')).context.contextWindow,
+    CODEX_ADAPTER_CONTEXT_WINDOW)
+  assert.deepEqual((await adapter.listModels(CODEX_PROVIDER)).map(model => model.name), [
+    'Pinned Sol',
+    'Dynamic',
+  ])
+})
+
+test('context overflow classification is conservative and keeps the original cause', () => {
+  const sdkError = new Error('Input exceeds the maximum length of 1048576 characters')
+  const classified = classifySdkError(sdkError)
+  assert.equal(classified.code, 'CONTEXT_WINDOW_EXCEEDED')
+  assert.equal(classified.cause, sdkError)
+  assert.match(classified.message, /1048576/)
+
+  const appServerError = classifySdkError({ error: { code: 'ContextWindowExceeded', message: 'request rejected' } })
+  assert.equal(appServerError.code, 'CONTEXT_WINDOW_EXCEEDED')
+  const codeBearingError = new Error('request rejected')
+  codeBearingError.code = 'ContextWindowExceeded'
+  assert.equal(classifySdkError(codeBearingError).code, 'CONTEXT_WINDOW_EXCEEDED')
+  const nestedCodeError = new Error('request rejected')
+  nestedCodeError.data = { detail: { type: 'ContextWindowExceeded' } }
+  assert.equal(classifySdkError(nestedCodeError).code, 'CONTEXT_WINDOW_EXCEEDED')
+  assert.equal(classifySdkError({ status: 400, data: { code: 'invalid_request' }, message: 'invalid request' }).code,
+    'CODEX_SDK')
+  assert.equal(classifySdkError({ status: 400, message: 'invalid request' }).code, 'CODEX_SDK')
+})
+
+test('adapter prepareCall exposes the conservative DSH context contract', async () => {
+  const adapter = new CodexSubscriptionAdapter({}, () => ({ startThread() {} }), async () => [])
+  const prepared = await adapter.prepareCall(CODEX_PROVIDER, 'gpt-live-or-custom')
+  assert.equal(prepared.model.context.contextWindow, CODEX_ADAPTER_CONTEXT_WINDOW)
+})
+
+test('DSH LlmRuntime.prepareCall preserves the Codex context contract', async () => {
+  const ctx = new Context()
+  const runtime = new LlmRuntime(ctx)
+  const adapter = new CodexSubscriptionAdapter({}, () => ({ startThread() {} }), async () => [])
+  runtime.registerAdapter([CODEX_PROVIDER], adapter)
+  const prepared = await runtime.prepareCall({
+    provider: CODEX_PROVIDER,
+    model: 'gpt-runtime-boundary',
+    system: '',
+    messages: [],
+  })
+  assert.equal(prepared.context.contextWindow, CODEX_ADAPTER_CONTEXT_WINDOW)
+})
+
+test('prepared adapter calls keep the configuration snapshot across dispatch', async () => {
+  let config = {
+    workingDirectory: '/old-cwd',
+    allowNetworkAccess: false,
+    models: [{ id: 'gpt-snapshot', name: 'Old model', contextWindow: 111_111 }],
+  }
+  const starts = []
+  const adapter = new CodexSubscriptionAdapter(() => config, () => ({
+    startThread(options) {
+      starts.push(options)
+      return {
+        id: `thread-${starts.length}`,
+        async runStreamed() {
+          return { events: streamedEvents([JSON.stringify({ reasoning: '', text: 'ok', tool_calls: [] })]) }
+        },
+      }
+    },
+  }), async () => [])
+  const prepared = await adapter.prepareCall(CODEX_PROVIDER, 'gpt-snapshot')
+  config = {
+    workingDirectory: '/new-cwd',
+    allowNetworkAccess: true,
+    models: [{ id: 'gpt-snapshot', name: 'New model', contextWindow: 222_222 }],
+  }
+
+  const request = {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-snapshot',
+    messages: [textMessage('request-1', 'hello')],
+  }
+  await collectIterable(prepared.stream(request))
+  assert.equal(prepared.model.name, 'Old model')
+  assert.equal(prepared.model.context.contextWindow, 111_111)
+  assert.equal(starts[0].workingDirectory, '/old-cwd')
+  assert.equal(starts[0].networkAccessEnabled, false)
+
+  const next = await adapter.prepareCall(CODEX_PROVIDER, 'gpt-snapshot')
+  assert.equal(next.model.name, 'New model')
+  assert.equal(next.model.context.contextWindow, 222_222)
+  await collectIterable(next.stream({ ...request, messages: [textMessage('request-2', 'again')] }))
+  assert.equal(starts[1].workingDirectory, '/new-cwd')
+  assert.equal(starts[1].networkAccessEnabled, true)
+})
+
+test('DSH prepared dispatch does not re-read plugin configuration', async () => {
+  let config = {
+    workingDirectory: '/runtime-old-cwd',
+    allowNetworkAccess: false,
+    models: [{ id: 'gpt-runtime-snapshot', name: 'Runtime old', contextWindow: 101_010 }],
+  }
+  const starts = []
+  const adapter = new CodexSubscriptionAdapter(() => config, () => ({
+    startThread(options) {
+      starts.push(options)
+      return {
+        id: `runtime-thread-${starts.length}`,
+        async runStreamed() {
+          return { events: streamedEvents([JSON.stringify({ reasoning: '', text: 'ok', tool_calls: [] })]) }
+        },
+      }
+    },
+  }), async () => [])
+  const ctx = new Context()
+  const runtime = new LlmRuntime(ctx)
+  runtime.registerAdapter([CODEX_PROVIDER], adapter)
+  const request = {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-runtime-snapshot',
+    messages: [textMessage('runtime-request', 'hello')],
+  }
+  const prepared = await runtime.prepareCall(request)
+  config = {
+    workingDirectory: '/runtime-new-cwd',
+    allowNetworkAccess: true,
+    models: [{ id: 'gpt-runtime-snapshot', name: 'Runtime new', contextWindow: 202_020 }],
+  }
+  await collectIterable(prepared.stream(request))
+  assert.equal(prepared.context.contextWindow, 101_010)
+  assert.equal(starts[0].workingDirectory, '/runtime-old-cwd')
+  assert.equal(starts[0].networkAccessEnabled, false)
+
+  const next = await runtime.prepareCall(request)
+  await collectIterable(next.stream(request))
+  assert.equal(next.context.contextWindow, 202_020)
+  assert.equal(starts[1].workingDirectory, '/runtime-new-cwd')
+  assert.equal(starts[1].networkAccessEnabled, true)
+})
+
+test('catalog and resolveModel propagate an abort signal without falling back', async () => {
+  const controller = new AbortController()
+  let received
+  let started
+  let release
+  const discoveryStarted = new Promise(resolve => {
+    started = resolve
+  })
+  const adapter = new CodexSubscriptionAdapter({}, () => assert.fail('client must stay lazy'), async (signal) => {
+    received = signal
+    started()
+    return new Promise(resolve => {
+      release = resolve
+    })
+  })
+  const pending = adapter.resolveModel(CODEX_PROVIDER, 'gpt-abort', controller.signal)
+  await discoveryStarted
+  controller.abort()
+  await assert.rejects(pending, error => error.code === 'ABORTED')
+  assert.equal(received, undefined)
+  release([])
+  await adapter.catalog()
+})
+
+test('shared catalog discovery lets caller A continue when caller B aborts', async () => {
+  let started
+  let release
+  let calls = 0
+  const discoveryStarted = new Promise(resolve => {
+    started = resolve
+  })
+  const adapter = new CodexSubscriptionAdapter({}, () => assert.fail('client must stay lazy'), async (signal) => {
+    assert.equal(signal, undefined)
+    calls += 1
+    started()
+    return new Promise(resolve => {
+      release = resolve
+    })
+  })
+  const a = adapter.resolveModel(CODEX_PROVIDER, 'gpt-shared', new AbortController().signal)
+  await discoveryStarted
+  const bController = new AbortController()
+  const b = adapter.resolveModel(CODEX_PROVIDER, 'gpt-shared', bController.signal)
+  bController.abort()
+  await assert.rejects(b, error => error.code === 'ABORTED')
+  assert.equal(getEventListeners(bController.signal, 'abort').length, 0)
+  release([{ id: 'gpt-shared', name: 'Shared model' }])
+  const resolved = await a
+  assert.equal(resolved.name, 'Shared model')
+  assert.equal(calls, 1)
+})
+
+test('shared catalog discovery lets caller B continue when caller A aborts', async () => {
+  let started
+  let release
+  let calls = 0
+  const discoveryStarted = new Promise(resolve => {
+    started = resolve
+  })
+  const adapter = new CodexSubscriptionAdapter({}, () => assert.fail('client must stay lazy'), async (signal) => {
+    assert.equal(signal, undefined)
+    calls += 1
+    started()
+    return new Promise(resolve => {
+      release = resolve
+    })
+  })
+  const aController = new AbortController()
+  const a = adapter.resolveModel(CODEX_PROVIDER, 'gpt-shared', aController.signal)
+  await discoveryStarted
+  const bController = new AbortController()
+  const b = adapter.listModels(CODEX_PROVIDER, bController.signal)
+  aController.abort()
+  await assert.rejects(a, error => error.code === 'ABORTED')
+  assert.equal(getEventListeners(aController.signal, 'abort').length, 0)
+  release([{ id: 'gpt-shared', name: 'Shared model' }])
+  const models = await b
+  assert.equal(getEventListeners(bController.signal, 'abort').length, 0)
+  assert.deepEqual(models.map(model => model.name), ['Shared model'])
+  assert.equal(calls, 1)
+})
+
+test('catalog shares failures and refreshes after its cache TTL', async () => {
+  let release
+  let started
+  let calls = 0
+  const discoveryStarted = new Promise(resolve => {
+    started = resolve
+  })
+  const failure = new Error('catalog unavailable')
+  const adapter = new CodexSubscriptionAdapter({}, () => assert.fail('client must stay lazy'), async (signal) => {
+    assert.equal(signal, undefined)
+    calls += 1
+    if (calls === 1) {
+      started()
+      return new Promise((resolve, reject) => {
+        release = reject
+      })
+    }
+    return [{ id: 'gpt-refreshed', name: 'Refreshed model' }]
+  })
+  const first = adapter.catalog()
+  await discoveryStarted
+  const second = adapter.catalog()
+  release(failure)
+  const results = await Promise.allSettled([first, second])
+  assert.equal(results[0].status, 'rejected')
+  assert.equal(results[1].status, 'rejected')
+  assert.equal(results[0].reason, failure)
+  assert.equal(results[1].reason, failure)
+  const cached = await adapter.catalog()
+  assert.equal(cached[0].id, 'gpt-refreshed')
+  assert.equal(calls, 2)
+  adapter.catalogAt -= 300_001
+  const refreshed = await adapter.catalog()
+  assert.equal(refreshed[0].id, 'gpt-refreshed')
+  assert.equal(calls, 3)
+})
+
+test('real Codex SDK accepts a safe-size lazy input without login or process start', async () => {
+  const codex = new Codex({ env: {}, config: { forced_login_method: 'chatgpt' } })
+  const thread = codex.startThread({ model: 'gpt-5.6-sol' })
+  assert.equal(thread.id, null)
+  assert.equal('compact' in thread, false)
+  const streamed = await thread.runStreamed('x'.repeat(CODEX_SAFE_PROMPT_CHAR_BUDGET - 1))
+  assert.equal(typeof streamed.events[Symbol.asyncIterator], 'function')
+})
+
 test('partialJsonString decodes streamed JSON string prefixes', () => {
   assert.deepEqual(partialJsonString('{"reasoning":"line\\npar', 'reasoning'), {
     found: true,
@@ -221,6 +533,431 @@ test('buildCodexPrompt carries the DSH system, history, and tool schemas', () =>
   assert.match(prompt, /"text":"inspect"/)
   assert.match(prompt, /"name":"read"/)
   assert.match(prompt, /Do not use your own shell/)
+})
+
+test('compaction source preserves message, block, and tool-result order across slices', () => {
+  const options = {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-5.6-sol',
+    purpose: 'compaction',
+    system: 'system-sentinel',
+    tools: [{ name: 'read', description: 'read', parameters: { type: 'object' } }],
+    messages: [
+      textMessage('user-1', 'first-sentinel'),
+      {
+        id: 'assistant-1',
+        role: 'assistant',
+        content: [{ type: 'tool-call', id: 'call-1', name: 'read', arguments: '{"path":"a"}' }],
+      },
+      {
+        id: 'tool-1',
+        role: 'user',
+        source: { kind: 'tool', callId: 'call-1' },
+        content: [{
+          type: 'tool-result',
+          toolCallId: 'call-1',
+          content: [{ type: 'text', text: 'tool-result-sentinel' }],
+        }],
+      },
+      textMessage('instruction', 'final-compaction-instruction'),
+    ],
+  }
+  const fragments = splitCompactionSource(options)
+  assert.deepEqual(fragments.map(fragment => fragment.order), fragments.map((_, index) => index))
+  assert.ok(fragments.find(fragment => fragment.text === 'first-sentinel'))
+  assert.ok(fragments.find(fragment => fragment.text === 'tool-result-sentinel'))
+  const toolCallFragments = fragments.filter(fragment => fragment.metadata?.toolCallId === 'call-1')
+  assert.ok(toolCallFragments.length >= 2)
+  assert.ok(toolCallFragments.every(fragment => fragment.metadata.pair === 'tool:call-1'))
+  assert.ok(toolCallFragments.every(fragment => fragment.metadata.part === 1))
+  assert.ok(toolCallFragments.some(fragment => fragment.metadata.pairType === 'tool-call'))
+  assert.ok(toolCallFragments.some(fragment => fragment.metadata.pairType === 'tool-result'))
+  assert.match(buildCompactionPrompt(options, fragments, 'intermediate'), /first-sentinel/)
+  assert.match(buildCompactionPrompt(options, fragments, 'intermediate'), /tool-result-sentinel/)
+})
+
+test('compaction packing keeps every prompt below the supplied budget and every source character', () => {
+  const source = 'BEGIN-SENTINEL-' + 'x'.repeat(6_000) + '-END-SENTINEL'
+  const toolSource = 'TOOL-BEGIN-' + 'y'.repeat(4_000) + '-TOOL-END'
+  const options = {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-5.6-sol',
+    purpose: 'compaction',
+    messages: [
+      textMessage('user-1', source),
+      {
+        id: 'tool-1',
+        role: 'user',
+        source: { kind: 'tool', callId: 'call-1' },
+        content: [{
+          type: 'tool-result',
+          toolCallId: 'call-1',
+          content: [{ type: 'text', text: toolSource }],
+        }],
+      },
+      textMessage('instruction', 'summarize'),
+    ],
+  }
+  const budget = 2_400
+  const groups = packCompactionFragments(options, splitCompactionSource(options), 'intermediate', budget)
+  assert.ok(groups.length > 1)
+  assert.ok(groups.every(group => buildCompactionPrompt(options, group, 'intermediate').length <= budget))
+  const textParts = groups.flatMap(group => group)
+    .filter(fragment => fragment.id.startsWith('message:0:'))
+    .sort((left, right) => (left.part ?? 1) - (right.part ?? 1))
+    .map(fragment => fragment.text)
+  assert.equal(textParts.join(''), source)
+  const toolParts = groups.flatMap(group => group)
+    .filter(fragment => fragment.metadata?.toolResultId === 'call-1' && fragment.metadata.blockType === 'text')
+    .sort((left, right) => (left.part ?? 1) - (right.part ?? 1))
+    .map(fragment => fragment.text)
+  assert.equal(toolParts.join(''), toolSource)
+})
+
+test('compaction prompt just below the safe budget stays on one isolated call', async () => {
+  const base = {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-5.6-sol',
+    purpose: 'compaction',
+  }
+  let low = 0
+  let high = CODEX_SAFE_PROMPT_CHAR_BUDGET
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2)
+    const candidate = { ...base, messages: [textMessage('user-1', 'x'.repeat(middle))] }
+    if (buildCodexPrompt(candidate).length < CODEX_SAFE_PROMPT_CHAR_BUDGET) low = middle
+    else high = middle - 1
+  }
+  const options = { ...base, messages: [textMessage('user-1', 'x'.repeat(low))] }
+  assert.ok(buildCodexPrompt(options).length < CODEX_SAFE_PROMPT_CHAR_BUDGET)
+  let starts = 0
+  const adapter = new CodexSubscriptionAdapter({}, () => ({
+    startThread() {
+      starts += 1
+      return {
+        id: `thread-${starts}`,
+        async runStreamed() {
+          return { events: streamedEvents([JSON.stringify({ reasoning: '', text: 'ok', tool_calls: [] })]) }
+        },
+      }
+    },
+  }))
+  await collectStream(adapter, options)
+  assert.equal(starts, 1)
+})
+
+test('segmented compaction recursively summarizes and accumulates all usage', async () => {
+  const options = {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-5.6-sol',
+    purpose: 'compaction',
+    system: 'system',
+    messages: [textMessage('user-1', 'A'.repeat(5_000)), textMessage('instruction', 'keep facts')],
+  }
+  const calls = []
+  let created = 0
+  const result = await prepareSegmentedCompaction(
+    options,
+    new AbortController().signal,
+    () => ({
+      id: `isolated-${++created}`,
+      async runStreamed(prompt) {
+        calls.push(prompt)
+        const text = prompt.includes('final pass') ? 'final-summary' : `intermediate-${calls.length}`
+        return { events: streamedEvents([
+          JSON.stringify({ reasoning: '', text, tool_calls: [] }),
+        ], {
+          input_tokens: 10,
+          cached_input_tokens: 2,
+          cache_write_input_tokens: 1,
+          output_tokens: 3,
+          reasoning_output_tokens: 4,
+        }) }
+      },
+    }),
+    { budget: 2_400 },
+  )
+
+  assert.ok(calls.length > 2)
+  assert.ok(calls.every(prompt => prompt.length <= 2_400))
+  assert.match(result.prompt, /final-summary|intermediate-/)
+  assert.deepEqual(result.usage, {
+    input_tokens: calls.length * 10,
+    cached_input_tokens: calls.length * 2,
+    cache_write_input_tokens: calls.length,
+    output_tokens: calls.length * 3,
+    reasoning_output_tokens: calls.length * 4,
+  })
+})
+
+test('segmented compaction keeps completed intermediate usage when final call fails', async () => {
+  const prompts = []
+  let starts = 0
+  const adapter = new CodexSubscriptionAdapter({}, () => ({
+    startThread() {
+      starts += 1
+      return {
+        id: `thread-${starts}`,
+        async runStreamed(prompt) {
+          prompts.push(prompt)
+          if (!prompt.includes('final pass')) {
+            return {
+              events: streamedEvents([
+                JSON.stringify({ reasoning: '', text: `summary-${starts}`, tool_calls: [] }),
+              ], {
+                input_tokens: 11,
+                cached_input_tokens: 3,
+                cache_write_input_tokens: 1,
+                output_tokens: 5,
+                reasoning_output_tokens: 2,
+              }),
+            }
+          }
+          return {
+            events: (async function * () {
+              yield {
+                type: 'item.completed',
+                item: {
+                  type: 'agent_message',
+                  id: 'final-message',
+                  text: JSON.stringify({ reasoning: '', text: 'partial final', tool_calls: [] }),
+                },
+              }
+              yield {
+                type: 'turn.completed',
+                usage: {
+                  input_tokens: 17,
+                  cached_input_tokens: 4,
+                  cache_write_input_tokens: 2,
+                  output_tokens: 6,
+                  reasoning_output_tokens: 3,
+                },
+              }
+              yield { type: 'turn.failed', error: new Error('final compaction failed') }
+            })(),
+          }
+        },
+      }
+    },
+  }))
+  const options = {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-5.6-sol',
+    purpose: 'compaction',
+    sessionId: 'session-compaction-final-failure',
+    messages: [
+      textMessage('history', 'h'.repeat(CODEX_SAFE_PROMPT_CHAR_BUDGET)),
+      textMessage('instruction', 'summarize the history'),
+    ],
+  }
+
+  let failure
+  await assert.rejects(collectStream(adapter, options), error => {
+    failure = error
+    return /final compaction failed/.test(error.message)
+  })
+  const usage = failure.codexUsage
+  const intermediateCalls = starts - 1
+  assert.equal(prompts.length, starts)
+  assert.deepEqual(usage, {
+    input_tokens: intermediateCalls * 11 + 17,
+    cached_input_tokens: intermediateCalls * 3 + 4,
+    cache_write_input_tokens: intermediateCalls + 2,
+    output_tokens: intermediateCalls * 5 + 6,
+    reasoning_output_tokens: intermediateCalls * 2 + 3,
+  })
+  assert.equal(failure.code, 'CODEX_SDK')
+})
+
+test('segmented compaction emits completed intermediate usage before an abort', async () => {
+  const controller = new AbortController()
+  let starts = 0
+  const adapter = new CodexSubscriptionAdapter({}, () => ({
+    startThread() {
+      starts += 1
+      return {
+        id: `thread-${starts}`,
+        async runStreamed(prompt) {
+          if (prompt.includes('final pass')) {
+            controller.abort()
+            throw new Error('aborted by caller')
+          }
+          return {
+            events: streamedEvents([
+              JSON.stringify({ reasoning: '', text: 'intermediate summary', tool_calls: [] }),
+            ], {
+              input_tokens: 13,
+              cached_input_tokens: 5,
+              cache_write_input_tokens: 2,
+              output_tokens: 7,
+              reasoning_output_tokens: 1,
+            }),
+          }
+        },
+      }
+    },
+  }))
+  const options = {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-5.6-sol',
+    purpose: 'compaction',
+    sessionId: 'session-compaction-abort-after-summary',
+    signal: controller.signal,
+    messages: [
+      textMessage('history', 'h'.repeat(CODEX_SAFE_PROMPT_CHAR_BUDGET)),
+      textMessage('instruction', 'summarize the history'),
+    ],
+  }
+
+  let failure
+  const chunks = []
+  await assert.rejects((async () => {
+    for await (const chunk of adapter.stream(options)) chunks.push(chunk)
+  })(), error => {
+    failure = error
+    return error.code === 'ABORTED'
+  })
+  const usageChunks = chunks.filter(chunk => chunk.type === 'usage')
+  assert.equal(starts > 1, true)
+  assert.equal(usageChunks.length, 1)
+  assert.deepEqual(usageChunks[0].usage, {
+    inputTokens: (starts - 1) * 6,
+    outputTokens: (starts - 1) * 7,
+    totalTokens: (starts - 1) * 20,
+    cacheReadTokens: (starts - 1) * 5,
+    cacheWriteTokens: (starts - 1) * 2,
+    reasoningTokens: starts - 1,
+  })
+  assert.deepEqual(failure.codexUsage, {
+    input_tokens: (starts - 1) * 13,
+    cached_input_tokens: (starts - 1) * 5,
+    cache_write_input_tokens: (starts - 1) * 2,
+    output_tokens: (starts - 1) * 7,
+    reasoning_output_tokens: starts - 1,
+  })
+})
+
+test('segmented compaction rejects a non-shrinking hierarchy and hard call limits', async () => {
+  const options = {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-5.6-sol',
+    purpose: 'compaction',
+    messages: [textMessage('history', 'h'.repeat(7_000)), textMessage('instruction', 'summarize')],
+  }
+  let calls = 0
+  await assert.rejects(prepareSegmentedCompaction(
+    options,
+    new AbortController().signal,
+    () => ({
+      id: `isolated-${++calls}`,
+      async runStreamed() {
+        return {
+          events: streamedEvents([
+            JSON.stringify({ reasoning: '', text: 'r'.repeat(10_000), tool_calls: [] }),
+          ]),
+        }
+      },
+    }),
+    { budget: 2_000, maxCallsPerLevel: CODEX_COMPACTION_MAX_CALLS_PER_LEVEL, maxCalls: CODEX_COMPACTION_MAX_CALLS },
+  ), error => error.code === 'CONTEXT_WINDOW_EXCEEDED')
+  assert.ok(calls > 0)
+
+  calls = 0
+  await assert.rejects(prepareSegmentedCompaction(
+    options,
+    new AbortController().signal,
+    () => ({
+      id: `isolated-${++calls}`,
+      async runStreamed() {
+        return { events: streamedEvents([JSON.stringify({ reasoning: '', text: 'small', tool_calls: [] })]) }
+      },
+    }),
+    { budget: 2_000, maxCallsPerLevel: 1, maxCalls: 2 },
+  ), error => error.code === 'CONTEXT_WINDOW_EXCEEDED')
+  assert.equal(calls, 0)
+})
+
+test('compaction requires the final user instruction independently of message source', async () => {
+  const base = {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-5.6-sol',
+    purpose: 'compaction',
+  }
+  const createThread = () => {
+    throw new Error('invalid compaction must not create a thread')
+  }
+  await assert.rejects(prepareSegmentedCompaction({
+    ...base,
+    messages: [textMessage('history', 'facts'), textMessage('last', 'not an assistant instruction', 'assistant')],
+  }, new AbortController().signal, createThread), error => error.code === 'PROTOCOL')
+  await assert.rejects(prepareSegmentedCompaction({
+    ...base,
+    messages: [textMessage('history', 'facts'), textMessage('last', '   ')],
+  }, new AbortController().signal, createThread), error => error.code === 'PROTOCOL')
+
+  const options = {
+    ...base,
+    messages: [textMessage('history', 'facts'), {
+      ...textMessage('last', 'summarize these facts'),
+      source: { kind: 'not-a-plugin' },
+    }],
+  }
+  const result = await prepareSegmentedCompaction(
+    options,
+    new AbortController().signal,
+    () => ({
+      id: 'isolated-valid',
+      async runStreamed(prompt) {
+        return { events: streamedEvents([
+          JSON.stringify({ reasoning: '', text: prompt.includes('final pass') ? 'final' : 'intermediate', tool_calls: [] }),
+        ]) }
+      },
+    }),
+    { budget: 2_000 },
+  )
+  assert.match(result.prompt, /summarize these facts/)
+})
+
+test('tool-call argument slices retain paired ids and reconstruct valid JSON', () => {
+  const argumentsText = JSON.stringify({ path: 'a', payload: 'q'.repeat(6_000) })
+  const options = {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-5.6-sol',
+    purpose: 'compaction',
+    messages: [
+      {
+        id: 'assistant-call',
+        role: 'assistant',
+        content: [{ type: 'tool-call', id: 'call-1', name: 'read', arguments: argumentsText }],
+      },
+      {
+        id: 'tool-result',
+        role: 'user',
+        content: [{
+          type: 'tool-result',
+          toolCallId: 'call-1',
+          content: [{ type: 'text', text: 'result-' + 'r'.repeat(6_000) }],
+        }],
+      },
+      textMessage('instruction', 'summarize'),
+    ],
+  }
+  const fragments = splitCompactionSource(options, { includeFinalInstruction: false })
+  const groups = packCompactionFragments(options, fragments, 'intermediate', 2_000)
+  const toolFragments = groups.flatMap(group => group)
+    .filter(fragment => fragment.metadata?.toolCallId === 'call-1')
+  assert.ok(toolFragments.length > 4)
+  assert.ok(toolFragments.every(fragment => fragment.metadata.pair === 'tool:call-1'))
+  assert.ok(toolFragments.every(fragment => Number.isInteger(fragment.metadata.part)))
+  assert.ok(toolFragments.every(fragment => fragment.metadata.part >= 1))
+  const argumentParts = toolFragments
+    .filter(fragment => fragment.metadata.pairType === 'tool-call' && fragment.metadata.field === 'arguments')
+    .sort((left, right) => left.metadata.part - right.metadata.part)
+  assert.equal(JSON.parse(argumentParts.map(fragment => fragment.text).join('')).payload.length, 6_000)
+  const resultParts = toolFragments
+    .filter(fragment => fragment.metadata.pairType === 'tool-result' && fragment.metadata.blockType === 'text')
+    .sort((left, right) => left.metadata.part - right.metadata.part)
+  assert.match(resultParts.map(fragment => fragment.text).join(''), /^result-/)
 })
 
 test('mapUsage produces disjoint DSH counters', () => {
@@ -949,6 +1686,87 @@ test('adapter handles auxiliary purposes outside the main session pool', async (
   })
 
   assert.equal(starts, 4)
+})
+
+test('adapter segments an oversized compaction request and emits one cumulative usage event', async () => {
+  const prompts = []
+  let starts = 0
+  const adapter = new CodexSubscriptionAdapter({}, () => ({
+    startThread() {
+      starts += 1
+      return {
+        id: `thread-${starts}`,
+        async runStreamed(prompt) {
+          prompts.push(prompt)
+          const text = prompt.includes('final pass') ? 'final-summary' : `intermediate-${starts}`
+          return {
+            events: streamedEvents([JSON.stringify({ reasoning: '', text, tool_calls: [] })], {
+              input_tokens: 10,
+              cached_input_tokens: 2,
+              cache_write_input_tokens: 1,
+              output_tokens: 3,
+              reasoning_output_tokens: 4,
+            }),
+          }
+        },
+      }
+    },
+  }))
+  const options = {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-5.6-sol',
+    purpose: 'compaction',
+    sessionId: 'session-oversized-compaction',
+    messages: [
+      textMessage('user-1', 'oversized-' + 'z'.repeat(CODEX_SAFE_PROMPT_CHAR_BUDGET)),
+      textMessage('instruction', 'summarize the preceding history'),
+    ],
+  }
+
+  const chunks = await collectStream(adapter, options)
+  assert.ok(starts > 2)
+  assert.ok(prompts.every(prompt => prompt.length <= CODEX_SAFE_PROMPT_CHAR_BUDGET))
+  assert.equal(chunks.filter(chunk => chunk.type === 'usage').length, 1)
+  assert.deepEqual(chunks.find(chunk => chunk.type === 'usage').usage, {
+    inputTokens: starts * 7,
+    outputTokens: starts * 3,
+    totalTokens: starts * 13,
+    cacheReadTokens: starts * 2,
+    cacheWriteTokens: starts,
+    reasoningTokens: starts * 4,
+  })
+  assert.deepEqual(chunks.at(-1), { type: 'finish', reason: { kind: 'stop' } })
+})
+
+test('segmented compaction aborts before any summary is exposed', async () => {
+  const controller = new AbortController()
+  controller.abort()
+  let starts = 0
+  const adapter = new CodexSubscriptionAdapter({}, () => ({
+    startThread() {
+      starts += 1
+      return {
+        id: `thread-${starts}`,
+        async runStreamed() {
+          throw new Error('must not run after abort')
+        },
+      }
+    },
+  }))
+  const options = {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-5.6-sol',
+    purpose: 'compaction',
+    sessionId: 'session-aborted-compaction',
+    signal: controller.signal,
+    messages: [
+      textMessage('user-1', 'oversized-' + 'x'.repeat(CODEX_SAFE_PROMPT_CHAR_BUDGET)),
+      textMessage('instruction', 'summarize the preceding history'),
+    ],
+  }
+
+  await assert.rejects(collectStream(adapter, options), error => error.code === 'ABORTED')
+  assert.equal(starts, 1)
 })
 
 test('adapter handles a turn.failed event as a thread failure', async () => {
