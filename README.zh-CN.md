@@ -22,7 +22,7 @@
 
 插件使用 OpenAI 官方 `@openai/codex-sdk` 和 `@openai/codex`。ChatGPT 登录、令牌刷新、模型目录和额度读取均由官方 Codex 运行时负责，插件本身不实现 OAuth，也不接收 API Key。
 
-每次 DSH 请求会转换为一个无状态 Codex 回合。Codex 返回结构化文本、推理摘要和 DSH 工具调用，工具执行继续使用 DSH 原有工具循环。
+每个活动中的 DSH 会话会在内存中复用一个 Codex 线程，并要求完整请求历史保持追加形式。首个回合之后，插件只发送新增的历史消息，让 Codex 能够复用提示缓存。缺少会话 ID、并发调用（返回 `SESSION_BUSY`）、失败后的重试、历史编辑或分叉，以及模型、推理强度或运行参数变化，都会启动隔离线程或进入明确的失败路径。`session-title` 和 `compaction` 辅助调用不会进入主线程池；`compaction` 会先使主会话 lineage 失效。插件不会持久化线程状态。Codex 返回结构化文本、推理摘要和 DSH 工具调用，工具执行继续使用 DSH 原有工具循环。
 
 默认运行参数：
 

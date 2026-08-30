@@ -22,7 +22,7 @@ This is a community integration and is not an official OpenAI or DeepSeek plugin
 
 The provider uses the official `@openai/codex-sdk` and `@openai/codex` packages. ChatGPT authentication, token refresh, model discovery, and quota lookup remain inside the official Codex runtime; the plugin neither implements OAuth nor accepts an API key.
 
-Each DSH request is projected into a stateless Codex turn. Codex returns structured text, reasoning summaries, and DSH tool calls, while tool execution stays in the existing DSH tool loop.
+Each active DSH session reuses one in-memory Codex thread while its complete request history remains append-only. The adapter sends only newly appended history after the first turn, so Codex can reuse its prompt cache. A missing session id, concurrent call (`SESSION_BUSY`), retry after failure, history edit/fork, or model, reasoning, and runtime option change starts an isolated thread or explicit failure path. Auxiliary `session-title` and `compaction` calls bypass the main pool; compaction invalidates the main session lineage first. Thread state is not persisted by the plugin. Codex returns structured text, reasoning summaries, and DSH tool calls, while tool execution stays in the existing DSH tool loop.
 
 Runtime defaults:
 

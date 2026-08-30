@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { homedir } from 'node:os'
@@ -18,6 +18,8 @@ export const CODEX_PROVIDER = 'codex'
 export const CODEX_SETTINGS_NAMESPACE = settingsNamespace('llm-codex-subscription')
 export const CODEX_CLI_PATH = createRequire(import.meta.url).resolve('@openai/codex/bin/codex.js')
 const API_ROOT = '/plugins/@local/dsh-codex-internal/api'
+export const CODEX_THREAD_POOL_MAX = 8
+export const CODEX_THREAD_POOL_IDLE_MS = 30 * 60 * 1000
 
 export const DEFAULT_MODELS = [
   {
@@ -258,9 +260,8 @@ function serializeBlock(block) {
   }
 }
 
-/** Build one stateless model turn from DSH's authoritative assembled request. */
-export function buildCodexPrompt(options) {
-  const payload = {
+function codexPayload(options) {
+  return {
     system: options.system ?? '',
     messages: options.messages.map(message => ({
       role: message.role,
@@ -271,18 +272,287 @@ export function buildCodexPrompt(options) {
       max_tokens: options.maxTokens ?? null,
     },
   }
+}
+
+/** Build one model turn from DSH's authoritative assembled request. */
+export function buildCodexPrompt(options, { messageStart = 0, continuation = false } = {}) {
+  const fullPayload = codexPayload(options)
+  const isContinuation = continuation
+    && Number.isInteger(messageStart)
+    && messageStart >= 0
+    && messageStart < fullPayload.messages.length
+  const payload = isContinuation
+    ? {
+        messages: fullPayload.messages.slice(messageStart),
+        generation: fullPayload.generation,
+      }
+    : fullPayload
 
   return [
-    'Act as the model backend for one DeepSeek Harness step.',
+    isContinuation
+      ? 'Continue the model backend for the next DeepSeek Harness step in this Codex thread.'
+      : 'Act as the model backend for one DeepSeek Harness step.',
     'Do not use your own shell, filesystem, web, MCP, or editing tools during this turn.',
-    'Use only the supplied payload. Treat payload.system as the authoritative system instruction',
-    'and payload.messages as the complete ordered conversation.',
+    isContinuation
+      ? 'The earlier Codex turns contain the authoritative DSH system instruction, tool schemas, and prior history.'
+      : 'Use only the supplied payload. Treat payload.system as the authoritative system instruction',
+    isContinuation
+      ? 'Apply the appended payload.messages to that history. They are the only new DSH messages for this turn.'
+      : 'and payload.messages as the complete ordered conversation.',
     'When a supplied DSH tool is needed, return it in tool_calls instead of executing it yourself.',
     'Never invent a tool result. arguments_json must encode one JSON object matching that tool schema.',
     'Return concise visible text and only a brief reasoning summary, not private chain-of-thought.',
     '',
     JSON.stringify(payload),
   ].join('\n')
+}
+
+function canonicalJson(value) {
+  if (value === null || value === undefined) return 'null'
+  if (typeof value === 'string') return JSON.stringify(value)
+  if (typeof value === 'number') return Number.isFinite(value) ? JSON.stringify(value) : 'null'
+  if (typeof value === 'boolean') return value ? 'true' : 'false'
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
+  if (typeof value === 'object') {
+    return `{${Object.keys(value)
+      .filter(key => value[key] !== undefined)
+      .sort()
+      .map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+      .join(',')}}`
+  }
+  return JSON.stringify(String(value))
+}
+
+function digest(value) {
+  return createHash('sha256').update(canonicalJson(value)).digest('hex')
+}
+
+/**
+ * Capture the complete request lineage used to decide whether a native Codex
+ * thread may receive the next DSH request. Message IDs make rewrites visible
+ * even when edited content happens to be identical.
+ */
+export function codexRequestLineage(options, threadOptions = {}) {
+  const payload = codexPayload(options)
+  const messages = payload.messages.map((message, index) => ({
+    id: options.messages[index]?.id ?? null,
+    ...message,
+  }))
+  return {
+    contextKey: digest({
+      generation: payload.generation,
+      purpose: options.purpose ?? null,
+      system: payload.system,
+      thread: threadOptions,
+      tools: payload.tools,
+    }),
+    messageKeys: messages.map(digest),
+    messageContentKeys: payload.messages.map(digest),
+    messageCount: messages.length,
+  }
+}
+
+function lineageContinues(previous, next) {
+  if (previous === undefined || next === undefined || previous.contextKey !== next.contextKey) return false
+  const cursor = previous.assistantCursor
+  if (previous.assistantFingerprint === undefined
+    || !Number.isInteger(cursor)
+    || next.messageKeys.length <= cursor + 1
+    || !Array.isArray(next.messageContentKeys)
+    || next.messageContentKeys[cursor] !== previous.assistantFingerprint) return false
+  return previous.messageKeys.every((key, index) => key === next.messageKeys[index])
+}
+
+function hasSessionId(sessionId) {
+  return typeof sessionId === 'string' && sessionId.length > 0
+}
+
+function hasNativeThreadId(thread) {
+  try {
+    return typeof thread?.id === 'string' && thread.id.length > 0
+  } catch {
+    return false
+  }
+}
+
+export function codexAssistantFingerprint(blocks) {
+  return digest({ role: 'assistant', content: blocks })
+}
+
+/**
+ * Keep one in-memory native Codex thread per DSH session lineage. A missing
+ * session id, concurrent call, rewritten history, or changed thread options
+ * always gets an isolated thread instead of guessing across sessions.
+ */
+export class CodexThreadPool {
+  constructor({
+    maxEntries = CODEX_THREAD_POOL_MAX,
+    idleMs = CODEX_THREAD_POOL_IDLE_MS,
+    now = Date.now,
+  } = {}) {
+    this.maxEntries = Number.isInteger(maxEntries) && maxEntries > 0
+      ? maxEntries
+      : CODEX_THREAD_POOL_MAX
+    this.idleMs = Number.isFinite(idleMs) && idleMs >= 0 ? idleMs : CODEX_THREAD_POOL_IDLE_MS
+    this.now = typeof now === 'function' ? now : Date.now
+    this.entries = new Map()
+    this.blocked = new Map()
+  }
+
+  size() {
+    return this.entries.size
+  }
+
+  prune() {
+    const now = this.now()
+    for (const [sessionId, entry] of this.entries) {
+      if (!entry.busy && now - entry.lastUsed >= this.idleMs) this.entries.delete(sessionId)
+    }
+  }
+
+  evict() {
+    while (this.entries.size > this.maxEntries) {
+      let oldestId
+      let oldestAt = Infinity
+      for (const [sessionId, entry] of this.entries) {
+        if (!entry.busy && entry.lastUsed < oldestAt) {
+          oldestId = sessionId
+          oldestAt = entry.lastUsed
+        }
+      }
+      if (oldestId === undefined) return
+      this.entries.delete(oldestId)
+    }
+  }
+
+  blockSession(sessionId) {
+    if (!hasSessionId(sessionId)) return
+    this.blocked.set(sessionId, (this.blocked.get(sessionId) ?? 0) + 1)
+  }
+
+  unblockSession(sessionId) {
+    if (!hasSessionId(sessionId)) return
+    const count = this.blocked.get(sessionId) ?? 0
+    if (count <= 1) this.blocked.delete(sessionId)
+    else this.blocked.set(sessionId, count - 1)
+  }
+
+  invalidateSession(sessionId) {
+    if (!hasSessionId(sessionId)) return
+    const entry = this.entries.get(sessionId)
+    if (entry === undefined) return
+    this.entries.delete(sessionId)
+    entry.invalidated = true
+    if (entry.busy && !entry.blocked) {
+      entry.blocked = true
+      this.blockSession(sessionId)
+    }
+  }
+
+  acquireIsolated({ sessionId, lineage, threadOptions, createThread, blockSession = false }) {
+    const thread = createThread()
+    const entry = {
+      blocked: blockSession && hasSessionId(sessionId),
+      busy: true,
+      invalidated: false,
+      lastUsed: this.now(),
+      lineage,
+      pooled: false,
+      sessionId: hasSessionId(sessionId) ? sessionId : undefined,
+      thread,
+      threadSignature: digest(threadOptions),
+    }
+    if (entry.blocked) this.blockSession(sessionId)
+    return this.createLease(entry, false, 0, lineage)
+  }
+
+  createLease(entry, reused, messageStart, lineage) {
+    let settled = false
+    const settle = (success, blocks) => {
+      if (settled) return
+      settled = true
+      entry.busy = false
+      if (entry.blocked) {
+        entry.blocked = false
+        this.unblockSession(entry.sessionId)
+      }
+      if (!success || entry.invalidated || !entry.pooled || this.entries.get(entry.sessionId) !== entry) {
+        if (!success && entry.pooled && this.entries.get(entry.sessionId) === entry) this.entries.delete(entry.sessionId)
+        return
+      }
+      if (!hasNativeThreadId(entry.thread) || !Array.isArray(blocks)) {
+        entry.invalidated = true
+        this.entries.delete(entry.sessionId)
+        return
+      }
+      entry.lineage = {
+        ...lineage,
+        assistantCursor: lineage.messageCount,
+        assistantFingerprint: codexAssistantFingerprint(blocks ?? []),
+      }
+      entry.lastUsed = this.now()
+      this.evict()
+    }
+    return {
+      get messageStart() {
+        return messageStart
+      },
+      get reused() {
+        return reused
+      },
+      thread: entry.thread,
+      release: (blocks) => settle(true, blocks),
+      invalidate: () => settle(false),
+    }
+  }
+
+  acquire({ sessionId, lineage, threadOptions, createThread }) {
+    this.prune()
+    const reusableSession = hasSessionId(sessionId)
+    if (reusableSession && this.blocked.has(sessionId)) {
+      throw new LlmError(`Codex DSH session "${sessionId}" is busy.`, 'SESSION_BUSY')
+    }
+    const existing = reusableSession ? this.entries.get(sessionId) : undefined
+    let entry
+    let reused = false
+    let messageStart = 0
+
+    if (existing !== undefined && existing.busy) {
+      throw new LlmError(`Codex DSH session "${sessionId}" is busy.`, 'SESSION_BUSY')
+    }
+    if (existing !== undefined) {
+      const signature = digest(threadOptions)
+      if (hasNativeThreadId(existing.thread)
+        && signature === existing.threadSignature
+        && lineageContinues(existing.lineage, lineage)) {
+        entry = existing
+        reused = true
+        messageStart = existing.lineage.assistantCursor + 1
+      } else {
+        existing.invalidated = true
+        this.entries.delete(sessionId)
+      }
+    }
+
+    if (entry === undefined) {
+      const thread = createThread()
+      const pooled = reusableSession && (existing === undefined || !existing.busy)
+      entry = {
+        busy: true,
+        lastUsed: this.now(),
+        lineage,
+        pooled,
+        sessionId: reusableSession ? sessionId : undefined,
+        thread,
+        threadSignature: digest(threadOptions),
+      }
+      if (pooled) this.entries.set(sessionId, entry)
+    } else {
+      entry.busy = true
+      entry.lastUsed = this.now()
+    }
+    return this.createLease(entry, reused, messageStart, lineage)
+  }
 }
 
 function parseStructuredResponse(text) {
@@ -351,6 +621,7 @@ export function mapUsage(usage) {
 }
 
 function classifySdkError(error) {
+  if (error instanceof LlmError) return error
   const message = error instanceof Error ? error.message : String(error)
   if (/aborted|abort/i.test(message)) return new LlmError(message, 'ABORTED', { cause: error })
   if (/401|403|authentication|login/i.test(message)) return new LlmError(message, 'AUTH', { cause: error })
@@ -587,11 +858,12 @@ export class CodexSubscriptionAdapter extends LlmAdapter {
   constructor(config = {}, createClient = () => new Codex({
     env: sanitizedEnvironment(),
     config: { forced_login_method: 'chatgpt' },
-  }), discoverCatalog = discoverCodexCatalog) {
+  }), discoverCatalog = discoverCodexCatalog, threadPool = new CodexThreadPool()) {
     super()
     this.resolveOptions = typeof config === 'function' ? config : () => config
     this.createClient = createClient
     this.discoverCatalog = discoverCatalog
+    this.threadPool = threadPool
     this.client = undefined
     this.liveCatalog = undefined
     this.catalogAt = 0
@@ -672,7 +944,7 @@ export class CodexSubscriptionAdapter extends LlmAdapter {
     }
 
     const config = this.options()
-    const thread = this.getClient().startThread({
+    const threadOptions = {
       model: options.model,
       workingDirectory: config.workingDirectory,
       skipGitRepoCheck: true,
@@ -681,31 +953,51 @@ export class CodexSubscriptionAdapter extends LlmAdapter {
       networkAccessEnabled: config.allowNetworkAccess,
       modelReasoningEffort: options.reasoningEffort,
       threadSource: 'dsh-llm-adapter',
-    })
+    }
+    const lineage = codexRequestLineage(options, threadOptions)
+    const isCompaction = options.purpose === 'compaction'
+    const isAuxiliary = isCompaction || options.purpose === 'session-title'
+    if (isCompaction) this.threadPool.invalidateSession(options.sessionId)
+    const lease = isAuxiliary
+      ? this.threadPool.acquireIsolated({
+          sessionId: options.sessionId,
+          lineage,
+          threadOptions,
+          blockSession: isCompaction,
+          createThread: () => this.getClient().startThread(threadOptions),
+        })
+      : this.threadPool.acquire({
+          sessionId: options.sessionId,
+          lineage,
+          threadOptions,
+          createThread: () => this.getClient().startThread(threadOptions),
+        })
+    let turnCompleted = false
+    let turnAccepted = false
+    let assistantBlocks = []
+    const assistantBlockMap = new Map()
 
-    let streamed
     try {
-      streamed = await thread.runStreamed(buildCodexPrompt(options), {
+      const streamed = await lease.thread.runStreamed(buildCodexPrompt(options, {
+        messageStart: lease.messageStart,
+        continuation: lease.reused,
+      }), {
         outputSchema: RESPONSE_SCHEMA,
         signal: options.signal,
       })
-    } catch (error) {
-      throw classifySdkError(error)
-    }
 
-    let finalResponse = ''
-    let usage
-    let reasoning = ''
-    let visibleText = ''
-    let reasoningStarted = false
-    let textStarted = false
-    let reasoningEnded = false
-    let textEnded = false
-    let reasoningIndex
-    let textIndex
-    let nextIndex = 0
+      let finalResponse = ''
+      let usage
+      let reasoning = ''
+      let visibleText = ''
+      let reasoningStarted = false
+      let textStarted = false
+      let reasoningEnded = false
+      let textEnded = false
+      let reasoningIndex
+      let textIndex
+      let nextIndex = 0
 
-    try {
       for await (const event of streamed.events) {
         if ((event.type === 'item.updated' || event.type === 'item.completed')
           && event.item?.type === 'agent_message') {
@@ -726,7 +1018,9 @@ export class CodexSubscriptionAdapter extends LlmAdapter {
           }
           if (reasoningStarted && !reasoningEnded && reasoningField.complete) {
             reasoningEnded = true
-            yield { type: 'block-end', index: reasoningIndex, block: { type: 'reasoning', text: reasoning } }
+            const block = { type: 'reasoning', text: reasoning }
+            assistantBlockMap.set(reasoningIndex, block)
+            yield { type: 'block-end', index: reasoningIndex, block }
           }
           if (nextText.length > visibleText.length) {
             if (!textStarted) {
@@ -740,85 +1034,102 @@ export class CodexSubscriptionAdapter extends LlmAdapter {
           }
           if (textStarted && !textEnded && textField.complete) {
             textEnded = true
-            yield { type: 'block-end', index: textIndex, block: { type: 'text', text: visibleText } }
+            const block = { type: 'text', text: visibleText }
+            assistantBlockMap.set(textIndex, block)
+            yield { type: 'block-end', index: textIndex, block }
           }
         } else if (event.type === 'turn.completed') {
           usage = event.usage
+          turnCompleted = true
         } else if (event.type === 'turn.failed') {
           throw new Error(event.error?.message ?? 'Codex turn failed.')
         } else if (event.type === 'error') {
           throw new Error(event.message)
         }
       }
+
+      const response = parseStructuredResponse(finalResponse)
+      if (response.reasoning.length > reasoning.length) {
+        if (!reasoningStarted) {
+          reasoningStarted = true
+          reasoningIndex = nextIndex
+          nextIndex += 1
+          yield { type: 'block-start', index: reasoningIndex, blockType: 'reasoning' }
+        }
+        yield { type: 'reasoning-delta', index: reasoningIndex, text: response.reasoning.slice(reasoning.length) }
+      }
+      if (response.text.length > visibleText.length) {
+        if (!textStarted) {
+          textStarted = true
+          textIndex = nextIndex
+          nextIndex += 1
+          yield { type: 'block-start', index: textIndex, blockType: 'text' }
+        }
+        yield { type: 'text-delta', index: textIndex, text: response.text.slice(visibleText.length) }
+      }
+      if (reasoningStarted && !reasoningEnded) {
+        const block = { type: 'reasoning', text: response.reasoning }
+        assistantBlockMap.set(reasoningIndex, block)
+        yield { type: 'block-end', index: reasoningIndex, block }
+      }
+      if (textStarted && !textEnded) {
+        const block = { type: 'text', text: response.text }
+        assistantBlockMap.set(textIndex, block)
+        yield { type: 'block-end', index: textIndex, block }
+      }
+
+      let index = nextIndex
+
+      for (const call of response.tool_calls) {
+        if (call === null || typeof call !== 'object' || Array.isArray(call)
+          || typeof call.name !== 'string' || call.name.length === 0
+          || typeof call.arguments_json !== 'string') {
+          throw new LlmError('Codex returned an invalid DSH tool call.', 'PROTOCOL')
+        }
+        let parsedArguments
+        try {
+          parsedArguments = JSON.parse(call.arguments_json)
+        } catch (error) {
+          throw new LlmError('Codex returned invalid JSON for a DSH tool call.', 'PROTOCOL', { cause: error })
+        }
+        if (parsedArguments === null || typeof parsedArguments !== 'object' || Array.isArray(parsedArguments)) {
+          throw new LlmError('Codex returned non-object arguments for a DSH tool call.', 'PROTOCOL')
+        }
+        const id = CallId(typeof call.id === 'string' && call.id.length > 0
+          ? call.id
+          : `codex-${randomUUID()}`)
+        const argumentsText = JSON.stringify(parsedArguments)
+        const block = { type: 'tool-call', id, name: call.name, arguments: argumentsText }
+        assistantBlockMap.set(index, block)
+        yield { type: 'block-start', index, blockType: 'tool-call' }
+        yield {
+          type: 'tool-call-delta',
+          index,
+          id,
+          name: call.name,
+          argumentsDelta: argumentsText,
+        }
+        yield { type: 'block-end', index, block }
+        index += 1
+      }
+
+      assistantBlocks = [...assistantBlockMap.entries()]
+        .sort((left, right) => left[0] - right[0])
+        .map(([, block]) => block)
+      const mappedUsage = mapUsage(usage ?? null)
+      if (mappedUsage !== undefined) yield { type: 'usage', usage: mappedUsage }
+      yield {
+        type: 'finish',
+        reason: response.tool_calls.length > 0 ? { kind: 'tool-calls' } : { kind: 'stop' },
+      }
+      turnAccepted = true
     } catch (error) {
       throw classifySdkError(error)
-    }
-
-    const response = parseStructuredResponse(finalResponse)
-    if (response.reasoning.length > reasoning.length) {
-      if (!reasoningStarted) {
-        reasoningStarted = true
-        reasoningIndex = nextIndex
-        nextIndex += 1
-        yield { type: 'block-start', index: reasoningIndex, blockType: 'reasoning' }
+    } finally {
+      if (turnCompleted && turnAccepted && options.signal?.aborted !== true && hasNativeThreadId(lease.thread)) {
+        lease.release(assistantBlocks)
       }
-      yield { type: 'reasoning-delta', index: reasoningIndex, text: response.reasoning.slice(reasoning.length) }
-    }
-    if (response.text.length > visibleText.length) {
-      if (!textStarted) {
-        textStarted = true
-        textIndex = nextIndex
-        nextIndex += 1
-        yield { type: 'block-start', index: textIndex, blockType: 'text' }
-      }
-      yield { type: 'text-delta', index: textIndex, text: response.text.slice(visibleText.length) }
-    }
-    if (reasoningStarted && !reasoningEnded) {
-      yield { type: 'block-end', index: reasoningIndex, block: { type: 'reasoning', text: response.reasoning } }
-    }
-    if (textStarted && !textEnded) {
-      yield { type: 'block-end', index: textIndex, block: { type: 'text', text: response.text } }
-    }
-
-    let index = nextIndex
-
-    for (const call of response.tool_calls) {
-      if (call === null || typeof call !== 'object' || Array.isArray(call)
-        || typeof call.name !== 'string' || call.name.length === 0
-        || typeof call.arguments_json !== 'string') {
-        throw new LlmError('Codex returned an invalid DSH tool call.', 'PROTOCOL')
-      }
-      let parsedArguments
-      try {
-        parsedArguments = JSON.parse(call.arguments_json)
-      } catch (error) {
-        throw new LlmError('Codex returned invalid JSON for a DSH tool call.', 'PROTOCOL', { cause: error })
-      }
-      if (parsedArguments === null || typeof parsedArguments !== 'object' || Array.isArray(parsedArguments)) {
-        throw new LlmError('Codex returned non-object arguments for a DSH tool call.', 'PROTOCOL')
-      }
-      const id = CallId(typeof call.id === 'string' && call.id.length > 0
-        ? call.id
-        : `codex-${randomUUID()}`)
-      const argumentsText = JSON.stringify(parsedArguments)
-      const block = { type: 'tool-call', id, name: call.name, arguments: argumentsText }
-      yield { type: 'block-start', index, blockType: 'tool-call' }
-      yield {
-        type: 'tool-call-delta',
-        index,
-        id,
-        name: call.name,
-        argumentsDelta: argumentsText,
-      }
-      yield { type: 'block-end', index, block }
-      index += 1
-    }
-
-    const mappedUsage = mapUsage(usage ?? null)
-    if (mappedUsage !== undefined) yield { type: 'usage', usage: mappedUsage }
-    yield {
-      type: 'finish',
-      reason: response.tool_calls.length > 0 ? { kind: 'tool-calls' } : { kind: 'stop' },
+      else lease.invalidate()
     }
   }
 }
