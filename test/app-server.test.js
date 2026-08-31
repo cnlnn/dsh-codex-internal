@@ -192,7 +192,21 @@ test('Windows private ACL helper uses icacls and validates machine-readable owne
 		assert.throws(() => validateWindowsAclSnapshot({
 			Protected: true,
 			Rules: [ownerRule, { ...ownerRule, Sid: 'S-1-1-0' }],
-		}, sid), /owner-only DACL/)
+		}, sid), error => {
+			assert.match(error.message, /owner-only DACL/)
+			assert.match(error.message, /Protected=true Rules=2 Type=Allow Rights=2032127 Inheritance=3 Propagation=0 Inherited=false SidMatches=true/)
+			assert.doesNotMatch(error.message, /S-1-1-0|codex-adapter|tmp/)
+			return true
+		})
+		assert.throws(() => validateWindowsAclSnapshot({
+			Protected: true,
+			Rules: [{ ...ownerRule, Sid: 'S-1-5-21-111-222-333-1002' }],
+		}, sid), error => {
+			assert.match(error.message, /owner rule is incomplete/)
+			assert.match(error.message, /Protected=true Rules=1 Type=Allow Rights=2032127 Inheritance=3 Propagation=0 Inherited=false SidMatches=false/)
+			assert.doesNotMatch(error.message, /S-1-5-21|codex-adapter|tmp/)
+			return true
+		})
 		assert.throws(() => applyWindowsPrivateDirectoryAcl(path, {
 			platform: 'win32',
 			userSid: sid,
