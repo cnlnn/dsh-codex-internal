@@ -1,10 +1,23 @@
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
 import { EventEmitter, getEventListeners } from 'node:events'
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import test from 'node:test'
 import {
+	CODEX_ADAPTER_VERSION,
+	CODEX_APP_SERVER_CONFIG_TOML,
 	CODEX_APP_SERVER_CONFIG_OVERRIDES,
 	CODEX_CLI_PATH,
 	CodexAppServerRpc,
+	applyWindowsPrivateDirectoryAcl,
+	atomicWritePrivateFile,
+	codexAppServerEnvironment,
+	ensureCodexRuntime,
+	expandHomePath,
+	resolveCodexRuntimePaths,
+	validateWindowsAclSnapshot,
 } from '../lib/app-server.js'
 import { CodexAppServerClient } from '../index.js'
 
@@ -89,6 +102,269 @@ function initializeAndRespond(onRequest = (child, message) => respond(child, mes
 		onRequest(child, message)
 	})
 }
+
+test('resolves the plugin Codex home from DSH_HOME without inheriting CODEX_HOME', () => {
+	const root = mkdtempSync(join(tmpdir(), 'dsh-codex-path-test-'))
+	try {
+		const testHome = join(root, 'test-user')
+		const configuredDshHome = join(root, 'dsh-configured')
+		const globalCodexHome = join(root, 'global-codex')
+		const paths = resolveCodexRuntimePaths({
+			env: { DSH_HOME: configuredDshHome, CODEX_HOME: globalCodexHome },
+			homeDir: testHome,
+		})
+		assert.deepEqual(paths, {
+			dshHome: configuredDshHome,
+			codexHome: join(configuredDshHome, 'codex-adapter'),
+			workspace: join(configuredDshHome, 'codex-adapter', 'workspace'),
+			configPath: join(configuredDshHome, 'codex-adapter', 'config.toml'),
+		})
+		const fallback = resolveCodexRuntimePaths({ env: { DSH_HOME: '  ' }, homeDir: testHome })
+		assert.equal(fallback.codexHome, join(testHome, '.dsh', 'codex-adapter'))
+
+		const environment = codexAppServerEnvironment({
+			paths,
+			source: { HOME: testHome, CODEX_HOME: globalCodexHome, OPENAI_API_KEY: 'must-not-pass' },
+		})
+		assert.equal(environment.CODEX_HOME, paths.codexHome)
+		assert.equal(environment.HOME, testHome)
+		assert.equal(environment.OPENAI_API_KEY, undefined)
+		assert.equal(environment.CODEX_SQLITE_HOME, undefined)
+	} finally {
+		rmSync(root, { recursive: true, force: true })
+	}
+})
+
+test('expands POSIX and Windows home shorthands before resolving the plugin home', () => {
+	const home = join(tmpdir(), 'dsh-home-expansion-test')
+	assert.equal(expandHomePath('~', home), home)
+	assert.equal(expandHomePath('~/codex-adapter', home), join(home, 'codex-adapter'))
+	assert.equal(expandHomePath('~\\codex-adapter', home), join(home, 'codex-adapter'))
+	assert.equal(expandHomePath('~other/codex-adapter', home), '~other/codex-adapter')
+	assert.equal(resolveCodexRuntimePaths({ env: { DSH_HOME: '~/dsh' }, homeDir: home }).dshHome, join(home, 'dsh'))
+	assert.equal(resolveCodexRuntimePaths({ env: { DSH_HOME: '~\\dsh' }, homeDir: home }).dshHome, join(home, 'dsh'))
+})
+
+test('Windows private ACL helper replaces explicit rules and fails closed on an extra ACE', () => {
+	const calls = []
+	const sid = 'S-1-5-21-111-222-333-1001'
+	const path = 'C:\\dsh\\codex-adapter'
+	const ownerRule = {
+		Sid: sid,
+		Type: 'Allow',
+		Rights: 0x1f01ff,
+		Inheritance: 3,
+		Propagation: 0,
+		Inherited: false,
+	}
+	const runCommand = (command, args) => {
+		calls.push({ command, args })
+		if (command === 'whoami') return 'USER\nS-1-5-21-111-222-333-1001\n'
+		return `DCA_ACL_RESULT:${JSON.stringify({ Protected: true, Rules: [ownerRule] })}`
+	}
+	applyWindowsPrivateDirectoryAcl(path, { platform: 'win32', runCommand })
+	assert.equal(calls.length, 2)
+	assert.deepEqual(calls[0], { command: 'whoami', args: ['/user'] })
+	assert.equal(calls[1].command, 'powershell.exe')
+	assert.deepEqual(calls[1].args.slice(0, 3), ['-NoLogo', '-NoProfile', '-NonInteractive'])
+	assert.equal(calls[1].args[3], '-EncodedCommand')
+	const script = Buffer.from(calls[1].args[4], 'base64').toString('utf16le')
+	assert.match(script, /SetAccessRuleProtection\(\$true, \$false\)/)
+	assert.match(script, /RemoveAccessRuleSpecific/)
+	assert.match(script, /\$rules\.Count -ne 1/)
+	assert.doesNotThrow(() => validateWindowsAclSnapshot({ Protected: true, Rules: [ownerRule] }, sid))
+	assert.throws(() => validateWindowsAclSnapshot({
+		Protected: true,
+		Rules: [ownerRule, { ...ownerRule, Sid: 'S-1-1-0' }],
+	}, sid), /owner-only DACL/)
+	assert.throws(() => applyWindowsPrivateDirectoryAcl(path, {
+		platform: 'win32',
+		userSid: sid,
+		runCommand() {
+			return `DCA_ACL_RESULT:${JSON.stringify({ Protected: true, Rules: [ownerRule, { ...ownerRule, Sid: 'S-1-1-0' }] })}`
+		},
+	}), /owner-only DACL/)
+	assert.throws(() => applyWindowsPrivateDirectoryAcl(path, {
+		platform: 'win32',
+		userSid: sid,
+		runCommand() {
+			throw new Error('access denied')
+		},
+	}), /access denied/)
+	const ignored = []
+	applyWindowsPrivateDirectoryAcl(join(tmpdir(), 'ignored'), {
+		platform: 'linux',
+		runCommand: (...args) => ignored.push(args),
+	})
+	assert.deepEqual(ignored, [])
+})
+
+test('writes a private minimal Codex config atomically and preserves the old file on replacement', () => {
+	const root = mkdtempSync(join(tmpdir(), 'dsh-codex-runtime-test-'))
+	try {
+		const paths = resolveCodexRuntimePaths({ env: { DSH_HOME: root }, homeDir: join(root, 'unused') })
+		ensureCodexRuntime({ paths })
+		if (process.platform !== 'win32') {
+			assert.equal(statSync(paths.codexHome).mode & 0o777, 0o700)
+			assert.equal(statSync(paths.workspace).mode & 0o777, 0o700)
+			assert.equal(statSync(paths.configPath).mode & 0o777, 0o600)
+		}
+		const canonical = readFileSync(paths.configPath, 'utf8')
+		assert.equal(canonical, CODEX_APP_SERVER_CONFIG_TOML)
+		assert.ok(canonical.indexOf('forced_login_method') < canonical.indexOf('[features]'))
+		const rootConfig = canonical.split('[features]', 1)[0]
+		assert.doesNotMatch(rootConfig, /^mcp_servers\s*=/m)
+		assert.doesNotMatch(rootConfig, /^plugins\s*=/m)
+
+		const before = process.platform === 'win32' ? undefined : statSync(paths.configPath).ino
+		atomicWritePrivateFile(paths.configPath, 'instructions = "replacement-marker"\n', 0o600)
+		assert.equal(readFileSync(paths.configPath, 'utf8'), 'instructions = "replacement-marker"\n')
+		if (process.platform !== 'win32') assert.notEqual(statSync(paths.configPath).ino, before)
+		assert.deepEqual(readdirSync(paths.codexHome).filter(name => name.endsWith('.tmp')), [])
+
+		// A later app-server generation restores the plugin-owned canonical config.
+		ensureCodexRuntime({ paths })
+		assert.equal(readFileSync(paths.configPath, 'utf8'), CODEX_APP_SERVER_CONFIG_TOML)
+		if (process.platform !== 'win32') assert.equal(statSync(paths.configPath).mode & 0o777, 0o600)
+	} finally {
+		rmSync(root, { recursive: true, force: true })
+	}
+})
+
+test('official app-server reads the isolated config and ignores global MCP and instruction markers', async () => {
+	const root = mkdtempSync(join(tmpdir(), 'dsh-codex-isolation-test-'))
+	let child
+	try {
+		const globalHome = join(root, 'global-codex')
+		mkdirSync(globalHome, { recursive: true, mode: 0o700 })
+		const marker = join(root, 'global-marker')
+		const markerCode = `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'loaded')`
+		const globalConfig = [
+			'instructions = "GLOBAL-INSTRUCTION-MARKER"',
+			'[mcp_servers.global_marker]',
+			`command = ${JSON.stringify(process.execPath)}`,
+			`args = ${JSON.stringify(['-e', markerCode])}`,
+		].join('\n') + '\n'
+		writeFileSync(join(globalHome, 'config.toml'), globalConfig, { mode: 0o600 })
+		const paths = resolveCodexRuntimePaths({ env: { DSH_HOME: join(root, 'dsh') }, homeDir: join(root, 'unused') })
+		ensureCodexRuntime({ paths })
+		const source = {
+			...process.env,
+			HOME: root,
+			CODEX_HOME: globalHome,
+		}
+		child = spawn(
+			process.execPath,
+			[CODEX_CLI_PATH, 'app-server', '--stdio'],
+			{
+				cwd: paths.workspace,
+				env: codexAppServerEnvironment({ paths, source }),
+				stdio: ['pipe', 'pipe', 'pipe'],
+			},
+		)
+		child.stdout.setEncoding('utf8')
+		child.stderr.setEncoding('utf8')
+		let stdout = ''
+		let stderr = ''
+		const exit = new Promise(resolve => child.once('exit', (code, signal) => resolve({ code, signal })))
+		const response = await new Promise((resolve, reject) => {
+			let settled = false
+			let buffer = ''
+			let initialized = false
+			const timer = setTimeout(() => finish(new Error(`config/read timed out. stdout=${stdout} stderr=${stderr}`)), 15_000)
+			const finish = (error, value) => {
+				if (settled) return
+				settled = true
+				clearTimeout(timer)
+				if (error === undefined) resolve(value)
+				else reject(error)
+			}
+			child.stdout.on('data', chunk => {
+				stdout += chunk
+				buffer += chunk
+				for (;;) {
+					const newline = buffer.indexOf('\n')
+					if (newline < 0) break
+					const line = buffer.slice(0, newline).trim()
+					buffer = buffer.slice(newline + 1)
+					if (line.length === 0) continue
+					let message
+					try { message = JSON.parse(line) } catch (error) {
+						finish(new Error(`invalid app-server JSON: ${error.message}; line=${line}`))
+						return
+					}
+					if (message.id === 1 && !initialized) {
+						initialized = true
+						child.stdin.write(`${JSON.stringify({ method: 'initialized', params: {} })}\n`)
+						child.stdin.write(`${JSON.stringify({ id: 2, method: 'config/read', params: {} })}\n`)
+					}
+					if (message.id === 2) finish(undefined, message)
+				}
+			})
+			child.stderr.on('data', chunk => { stderr += chunk })
+			child.once('error', error => finish(error))
+			child.once('exit', (code, signal) => {
+				if (!settled) finish(new Error(`app-server exited before config/read: code=${code} signal=${signal}; stdout=${stdout} stderr=${stderr}`))
+			})
+			child.stdin.write(`${JSON.stringify({ id: 1, method: 'initialize', params: {
+				clientInfo: { name: 'dsh-isolation-test', version: CODEX_ADAPTER_VERSION },
+				capabilities: { experimentalApi: true },
+			} })}\n`)
+		})
+		child.stdin.end()
+		await Promise.race([exit, new Promise(resolve => setTimeout(resolve, 1_000))])
+		assert.ok(response?.result?.config)
+		assert.equal(response.result.config.instructions, null)
+		assert.equal(response.result.config.developer_instructions, null)
+		assert.equal(response.result.config.model_instructions_file, null)
+		assert.deepEqual(response.result.config.mcp_servers, {})
+		assert.deepEqual(response.result.config.plugins, {})
+		assert.equal(response.result.config.hooks, null)
+		for (const feature of ['apps', 'plugins', 'hooks', 'memories', 'shell_tool', 'unified_exec', 'view_image', 'multi_agent', 'web_search', 'standalone_web_search']) {
+			assert.equal(response.result.config.features[feature], false, feature)
+		}
+		assert.equal(readFileSync(join(globalHome, 'config.toml'), 'utf8'), globalConfig)
+		assert.equal(statSync(marker, { throwIfNoEntry: false }), undefined)
+	} finally {
+		if (child !== undefined && child.exitCode === null) child.kill()
+		rmSync(root, { recursive: true, force: true })
+	}
+})
+
+test('app-server generations use the same private home and controlled cwd for thread resume', async () => {
+	const root = mkdtempSync(join(tmpdir(), 'dsh-codex-restart-test-'))
+	try {
+		const paths = resolveCodexRuntimePaths({ env: { DSH_HOME: root }, homeDir: join(root, 'unused') })
+		const makeHarness = () => initializeAndRespond((child, message) => {
+			if (message.method === 'thread/start' || message.method === 'thread/resume') {
+				respond(child, message.id, { thread: { id: 'persisted-thread' } })
+				return
+			}
+			respond(child, message.id, { ok: true })
+		})
+
+		const first = makeHarness()
+		const firstRpc = new CodexAppServerRpc({ spawn: first.spawn, runtimePaths: paths })
+		assert.deepEqual(await firstRpc.request('thread/start', { ephemeral: false }), {
+			thread: { id: 'persisted-thread' },
+		})
+		firstRpc.close()
+
+		const second = makeHarness()
+		const secondRpc = new CodexAppServerRpc({ spawn: second.spawn, runtimePaths: paths })
+		assert.deepEqual(await secondRpc.request('thread/resume', { threadId: 'persisted-thread' }), {
+			thread: { id: 'persisted-thread' },
+		})
+		assert.equal(first.calls[0].options.cwd, paths.workspace)
+		assert.equal(second.calls[0].options.cwd, paths.workspace)
+		assert.equal(first.calls[0].options.env.CODEX_HOME, paths.codexHome)
+		assert.equal(second.calls[0].options.env.CODEX_HOME, paths.codexHome)
+		assert.equal(readFileSync(paths.configPath, 'utf8'), CODEX_APP_SERVER_CONFIG_TOML)
+		secondRpc.close()
+	} finally {
+		rmSync(root, { recursive: true, force: true })
+	}
+})
 
 test('lazily initializes once and reuses one child for sequential requests', async () => {
 	const harness = initializeAndRespond()

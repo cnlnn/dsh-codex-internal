@@ -4,7 +4,7 @@ import { getEventListeners } from 'node:events'
 import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 import { Context } from '@deepseek-ai/cordis'
-import { LlmError, LlmRuntime } from '@deepseek-ai/dsh-llm'
+import { CONTEXT_WINDOW_EXCEEDED_CODE, LlmError, LlmRuntime } from '@deepseek-ai/dsh-llm'
 import {
   buildCodexPrompt,
   buildCodexInput,
@@ -13,6 +13,10 @@ import {
   CODEX_API_ROOT,
   CODEX_LEGACY_API_ROOT,
   CODEX_IMAGE_REQUEST_POLICY,
+  appServerThreadParams,
+  codexInputLength,
+  CODEX_REPLAY_STATE_KIND,
+  CODEX_REPLAY_STATE_VERSION,
   CODEX_COMPACTION_MAX_CALLS,
   CODEX_COMPACTION_MAX_CALLS_PER_LEVEL,
   CODEX_SAFE_PROMPT_CHAR_BUDGET,
@@ -130,6 +134,20 @@ function textMessage(id, text, role = 'user') {
     id,
     role,
     content: [{ type: 'text', text }],
+  }
+}
+
+function replayAssistantMessage(id, text, model, replayState) {
+  return {
+    id,
+    role: 'assistant',
+    content: [{ type: 'text', text }],
+    source: {
+      kind: 'model',
+      provider: CODEX_PROVIDER,
+      model,
+      replayState,
+    },
   }
 }
 
@@ -1030,6 +1048,7 @@ test('app-server adapter maps v2 events, usage, and request controls', async () 
     sandbox: 'read-only',
     config: { 'sandbox_workspace_write.network_access': true },
     threadSource: 'dsh-test',
+    ephemeral: false,
   })
   const turn = rpc.calls.find(call => call.method === 'turn/start')
   assert.deepEqual(turn.params, {
@@ -1043,6 +1062,36 @@ test('app-server adapter maps v2 events, usage, and request controls', async () 
     summary: 'auto',
     outputSchema,
   })
+})
+
+test('app-server thread params mark auxiliary starts ephemeral and never mark resumes', () => {
+  const auxiliary = appServerThreadParams({
+    model: 'gpt-5.6-sol',
+    ephemeral: true,
+    threadSource: 'dsh-compaction',
+  })
+  assert.equal(auxiliary.ephemeral, true)
+  assert.equal(auxiliary.threadSource, 'dsh-compaction')
+
+  const ordinary = appServerThreadParams({ model: 'gpt-5.6-sol' })
+  assert.equal(ordinary.ephemeral, false)
+
+  const resumed = appServerThreadParams({
+    model: 'gpt-5.6-sol',
+    ephemeral: true,
+    threadSource: 'must-not-be-forwarded',
+  }, { resume: true, threadId: 'thread-restart' })
+  assert.equal(resumed.threadId, 'thread-restart')
+  assert.equal(Object.hasOwn(resumed, 'ephemeral'), false)
+  assert.equal(Object.hasOwn(resumed, 'threadSource'), false)
+})
+
+test('app-server resume rejects a response without a resumed thread id', async () => {
+  const rpc = new FakeAppServerRpc(method => method === 'thread/resume' ? {} : undefined)
+  const client = new CodexAppServerClient({ rpc })
+  const thread = client.resumeThread('thread-missing-id', { model: 'gpt-5.6-sol' })
+  await assert.rejects(thread.ensureThread(), error => error.code === 'THREAD_RESUME_FAILED')
+  await client.close()
 })
 
 test('app-server adapter maps native reasoning deltas and completed array summaries', async () => {
@@ -1333,6 +1382,8 @@ test('app-server adapter resumes a thread after a disconnected generation', asyn
     'thread/resume',
     'turn/start',
   ])
+  const resume = rpc.calls.find(call => call.method === 'thread/resume')
+  assert.equal(Object.hasOwn(resume.params, 'ephemeral'), false)
 })
 
 test('model discovery and quota lookup share one adapter app-server client', async () => {
@@ -1535,6 +1586,42 @@ test('buildCodexInput projects ordered image attachments to native data URLs', a
   assert.match(input[0].text, new RegExp(second.attachmentId))
 })
 
+test('buildCodexInput reads duplicate durable refs once but preserves both occurrences', async () => {
+  const image = {
+    attachmentId: 'sha256:duplicate-image', mediaType: 'image/png', bytes: 3, width: 1, height: 1,
+  }
+  let reads = 0
+  const input = await buildCodexInput({
+    provider: CODEX_PROVIDER,
+    model: 'gpt-image',
+    messages: [
+      { role: 'user', content: [{ type: 'image', attachment: image }] },
+      { role: 'user', content: [{ type: 'image', attachment: image }] },
+    ],
+  }, {
+    id: 'gpt-image',
+    inputModalities: ['text', 'image'],
+  }, {
+    async readImageRequest(ref) {
+      reads += 1
+      return {
+        attachment: ref,
+        data: Uint8Array.from([1, 2, 3]),
+        mediaType: ref.mediaType,
+        bytes: 3,
+        width: ref.width,
+        height: ref.height,
+      }
+    },
+  })
+  assert.equal(reads, 1)
+  assert.deepEqual(input.filter(item => item.type === 'image'), [
+    { type: 'image', url: 'data:image/png;base64,AQID' },
+    { type: 'image', url: 'data:image/png;base64,AQID' },
+  ])
+  assert.equal(input.filter(item => item.type === 'text' && item.text.startsWith('\n[DSH image')).length, 2)
+})
+
 test('image projection fails closed for unsupported models and missing attachment service', async () => {
   const options = {
     provider: CODEX_PROVIDER,
@@ -1554,6 +1641,79 @@ test('image projection fails closed for unsupported models and missing attachmen
     buildCodexInput(options, { id: 'gpt-image', inputModalities: ['text', 'image'] }, undefined),
     error => error.code === 'ATTACHMENT_SERVICE_UNAVAILABLE',
   )
+})
+
+test('image projection rejects corrupted or identity-changing request versions', async () => {
+  const image = {
+    attachmentId: 'sha256:corrupt-image', mediaType: 'image/png', bytes: 3, width: 1, height: 1,
+  }
+  const base = {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-image',
+    messages: [{ role: 'user', content: [{ type: 'image', attachment: image }] }],
+  }
+  await assert.rejects(buildCodexInput(base, { id: 'gpt-image', inputModalities: ['text', 'image'] }, {
+    async readImageRequest(ref) {
+      return { attachment: ref, data: Uint8Array.from([1, 2, 3]), mediaType: ref.mediaType, bytes: 2, width: 1, height: 1 }
+    },
+  }), error => error.code === 'ATTACHMENT_PROJECTION_FAILED')
+  await assert.rejects(buildCodexInput(base, { id: 'gpt-image', inputModalities: ['text', 'image'] }, {
+    async readImageRequest(ref) {
+      return {
+        attachment: { ...ref, width: 9 },
+        data: Uint8Array.from([1, 2, 3]),
+        mediaType: ref.mediaType,
+        bytes: 3,
+        width: 9,
+        height: 1,
+      }
+    },
+  }), error => error.code === 'ATTACHMENT_PROJECTION_FAILED')
+})
+
+test('adapter rejects a 700KB native image before runStreamed', async () => {
+  const imageBytes = 700 * 1024
+  const image = {
+    attachmentId: 'sha256:oversized-native-image', mediaType: 'image/png', bytes: imageBytes, width: 1, height: 1,
+  }
+  let runs = 0
+  const adapter = new CodexSubscriptionAdapter({
+    models: [{ id: 'gpt-image', inputModalities: ['text', 'image'] }],
+  }, () => ({
+    startThread() {
+      return {
+        id: 'thread-oversized-native-image',
+        async runStreamed() {
+          runs += 1
+          throw new Error('oversized native image must fail before run')
+        },
+      }
+    },
+  }), undefined, undefined, {
+    async readImageRequest(ref) {
+      return {
+        attachment: ref,
+        data: new Uint8Array(imageBytes),
+        mediaType: ref.mediaType,
+        bytes: imageBytes,
+        width: ref.width,
+        height: ref.height,
+      }
+    },
+  })
+  const projected = [{
+    type: 'image',
+    url: `data:image/png;base64,${Buffer.alloc(imageBytes).toString('base64')}`,
+  }]
+  assert.ok(codexInputLength(projected) > CODEX_SAFE_PROMPT_CHAR_BUDGET)
+  const failure = await collectStreamFailure(adapter, {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-image',
+    messages: [{ id: 'image-user', role: 'user', content: [{ type: 'image', attachment: image }] }],
+  })
+  assert.equal(failure.error.code, CONTEXT_WINDOW_EXCEEDED_CODE)
+  assert.equal(runs, 0)
+  await adapter.close()
 })
 
 test('compaction source preserves message, block, and tool-result order across slices', () => {
@@ -1595,6 +1755,50 @@ test('compaction source preserves message, block, and tool-result order across s
   assert.ok(toolCallFragments.some(fragment => fragment.metadata.pairType === 'tool-result'))
   assert.match(buildCompactionPrompt(options, fragments, 'intermediate'), /first-sentinel/)
   assert.match(buildCompactionPrompt(options, fragments, 'intermediate'), /tool-result-sentinel/)
+})
+
+test('compaction source records nested image origin and durable ref metadata', () => {
+  const image = {
+    attachmentId: 'sha256:source-nested-image', mediaType: 'image/png', bytes: 3, width: 4, height: 5,
+  }
+  const options = {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-image',
+    purpose: 'compaction',
+    messages: [{
+      id: 'tool-message',
+      role: 'user',
+      content: [{
+        type: 'tool-result',
+        toolCallId: 'call-source',
+        content: [{ type: 'text', text: 'before' }, { type: 'image', attachment: image }],
+      }],
+    }, textMessage('instruction', 'summarize')],
+  }
+  const fragment = splitCompactionSource(options, { includeFinalInstruction: false })
+    .find(candidate => candidate.kind === 'image')
+  assert.ok(fragment)
+  assert.equal(fragment.metadata.blockPath, '0.1')
+  assert.equal(fragment.metadata.toolResultId, 'call-source')
+  assert.equal(fragment.metadata.pair, 'tool:call-source')
+  assert.deepEqual(fragment.imageRefs, [{
+    ref: image,
+    messageIndex: 0,
+    messageId: 'tool-message',
+    role: 'user',
+    blockIndex: 0,
+    blockPath: '0.1',
+    blockType: 'image',
+    toolResultId: 'call-source',
+    toolCallId: 'call-source',
+    pair: 'tool:call-source',
+    pairType: 'tool-result',
+    toolResultContentIndex: 1,
+  }])
+  const prompt = buildCompactionPrompt(options, [fragment], 'intermediate')
+  assert.match(prompt, new RegExp(image.attachmentId))
+  assert.match(prompt, /blockPath/)
+  assert.doesNotMatch(prompt, /AQID/)
 })
 
 test('compaction packing keeps every prompt below the supplied budget and every source character', () => {
@@ -1939,11 +2143,27 @@ test('compaction requires the final user instruction independently of message so
   assert.match(result.prompt, /summarize these facts/)
 })
 
-test('adapter refuses image compaction instead of silently dropping attachments', async () => {
+test('adapter compacts image history with native input and deterministic references', async () => {
   let starts = 0
   let runs = 0
+  const inputs = []
+  const reads = []
   const image = {
-    attachmentId: 'sha256:compaction-image', mediaType: 'image/png', bytes: 1, width: 1, height: 1,
+    attachmentId: 'sha256:compaction-image', mediaType: 'image/png', bytes: 3, width: 1, height: 1,
+  }
+  const attachments = {
+    async readImageRequest(ref) {
+      reads.push(ref.attachmentId)
+      return {
+        variantId: `variant:${ref.attachmentId}`,
+        attachment: ref,
+        data: Uint8Array.from([1, 2, 3]),
+        mediaType: ref.mediaType,
+        bytes: 3,
+        width: ref.width,
+        height: ref.height,
+      }
+    },
   }
   const adapter = new CodexSubscriptionAdapter({
     models: [{ id: 'gpt-image', inputModalities: ['text', 'image'] }],
@@ -1952,14 +2172,16 @@ test('adapter refuses image compaction instead of silently dropping attachments'
       starts += 1
       return {
         id: `thread-compaction-image-${starts}`,
-        async runStreamed() {
+        async runStreamed(input) {
           runs += 1
-          throw new Error('image compaction must fail before run')
+          inputs.push(input)
+          const finalResponse = JSON.stringify({ reasoning: '', text: 'visual summary', tool_calls: [] })
+          return { events: streamedEvents([finalResponse]) }
         },
       }
     },
-  }))
-  await assert.rejects(collectStream(adapter, {
+  }), undefined, undefined, attachments)
+  const chunks = await collectStream(adapter, {
     provider: CODEX_PROVIDER,
     model: 'gpt-image',
     purpose: 'compaction',
@@ -1968,22 +2190,38 @@ test('adapter refuses image compaction instead of silently dropping attachments'
       { id: 'history', role: 'user', content: [{ type: 'image', attachment: image }] },
       textMessage('instruction', 'summarize the history'),
     ],
-  }), error => error.code === 'ATTACHMENT_COMPACTION_UNSUPPORTED')
+  })
   assert.equal(starts, 1)
-  assert.equal(runs, 0)
+  assert.equal(runs, 1)
+  assert.deepEqual(reads, [image.attachmentId])
+  assert.ok(Array.isArray(inputs[0]))
+  assert.match(inputs[0][0].text, new RegExp(image.attachmentId))
+  assert.equal(inputs[0][1].type, 'text')
+  assert.equal(inputs[0][2].type, 'image')
+  assert.equal(inputs[0][2].url, 'data:image/png;base64,AQID')
+  const summaryText = chunks
+    .filter(chunk => chunk.type === 'block-end' && chunk.block?.type === 'text')
+    .map(chunk => chunk.block.text)
+    .join('\n')
+  assert.match(summaryText, /visual summary/)
+  assert.match(summaryText, new RegExp(`attachmentId=${image.attachmentId}`))
+  assert.match(summaryText, /message=0; block=0/)
+  assert.doesNotMatch(summaryText, /AQID/)
+  assert.deepEqual(chunks.at(-1), { type: 'finish', reason: { kind: 'stop' } })
 })
 
-test('segmented compaction rejects nested images before isolated calls', async () => {
+test('segmented compaction preserves nested image occurrences and reuses one read', async () => {
   const image = {
-    attachmentId: 'sha256:nested-compaction-image', mediaType: 'image/png', bytes: 1, width: 1, height: 1,
+    attachmentId: 'sha256:nested-compaction-image', mediaType: 'image/png', bytes: 3, width: 2, height: 3,
   }
-  let calls = 0
+  const reads = []
+  const inputs = []
   const options = {
     provider: CODEX_PROVIDER,
-    model: 'gpt-5.6-sol',
+    model: 'gpt-image',
     purpose: 'compaction',
     messages: [
-      textMessage('history', 'facts'),
+      textMessage('history', 'facts-' + 'x'.repeat(6_000)),
       {
         id: 'tool-result',
         role: 'user',
@@ -1996,15 +2234,358 @@ test('segmented compaction rejects nested images before isolated calls', async (
       textMessage('instruction', 'summarize the history'),
     ],
   }
+  const attachments = {
+    async readImageRequest(ref) {
+      reads.push(ref.attachmentId)
+      return {
+        attachment: ref,
+        data: Uint8Array.from([7, 8, 9]),
+        mediaType: ref.mediaType,
+        bytes: 3,
+        width: ref.width,
+        height: ref.height,
+      }
+    },
+  }
+  let created = 0
+  const result = await prepareSegmentedCompaction(
+    options,
+    new AbortController().signal,
+    () => ({
+      id: `nested-${++created}`,
+      async runStreamed(input) {
+        inputs.push(input)
+        const prompt = Array.isArray(input) ? input[0].text : input
+        const text = prompt.includes('final pass') ? 'final visual summary' : `intermediate-${created}`
+        return {
+          events: streamedEvents([JSON.stringify({ reasoning: '', text, tool_calls: [] })], {
+            input_tokens: 2,
+            output_tokens: 1,
+          }),
+        }
+      },
+    }),
+    {
+      budget: 3_000,
+      model: { id: 'gpt-image', inputModalities: ['text', 'image'] },
+      getAttachments: attachments,
+    },
+  )
+  assert.ok(created > 2)
+  assert.deepEqual(reads, [image.attachmentId])
+  const imageInputs = inputs.filter(input => Array.isArray(input) && input.some(item => item.type === 'image'))
+  assert.ok(imageInputs.length > 0)
+  assert.equal(imageInputs[0].find(item => item.type === 'image').url, 'data:image/png;base64,BwgJ')
+  assert.match(imageInputs[0][0].text, new RegExp(image.attachmentId))
+  assert.match(imageInputs[0][0].text, /blockPath|block=1\.0\.0/)
+  assert.equal(imageInputs.length, 1)
+  assert.match(result.prompt, new RegExp(image.attachmentId))
+  assert.equal(typeof result.input, 'string')
+  assert.doesNotMatch(result.input, /data:image\/png;base64/)
+  assert.deepEqual(result.usage, {
+    input_tokens: created * 2,
+    output_tokens: created,
+  })
+})
+
+test('segmented image compaction sends each image once and keeps the final pass text-only', async () => {
+  const first = {
+    attachmentId: 'sha256:segmented-image-one', mediaType: 'image/png', bytes: 500, width: 10, height: 11,
+  }
+  const second = {
+    attachmentId: 'sha256:segmented-image-two', mediaType: 'image/png', bytes: 500, width: 20, height: 21,
+  }
+  const options = {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-image',
+    purpose: 'compaction',
+    messages: [
+      { id: 'image-one', role: 'user', content: [{ type: 'image', attachment: first }] },
+      { id: 'image-two', role: 'user', content: [{ type: 'image', attachment: second }] },
+      textMessage('instruction', 'summarize both images'),
+    ],
+  }
+  const inputs = []
+  let reads = 0
+  let created = 0
+  const result = await prepareSegmentedCompaction(
+    options,
+    new AbortController().signal,
+    () => ({
+      id: `segmented-images-${++created}`,
+      async runStreamed(input) {
+        inputs.push(input)
+        return {
+          events: streamedEvents([
+            JSON.stringify({ reasoning: '', text: `visual-summary-${created}`, tool_calls: [] }),
+          ]),
+        }
+      },
+    }),
+    {
+      budget: 4_000,
+      model: { id: 'gpt-image', inputModalities: ['text', 'image'] },
+      getAttachments: {
+        async readImageRequest(ref) {
+          reads += 1
+          return {
+            attachment: ref,
+            data: Uint8Array.from({ length: ref.bytes }, (_, index) =>
+              ref.attachmentId.endsWith('one') ? index % 251 : (index + 1) % 251),
+            mediaType: ref.mediaType,
+            bytes: ref.bytes,
+            width: ref.width,
+            height: ref.height,
+          }
+        },
+      },
+    },
+  )
+  assert.equal(reads, 2)
+  assert.equal(inputs.length, 2)
+  const imageInputs = inputs.map(input => input.filter(item => item.type === 'image'))
+  assert.deepEqual(imageInputs.map(items => items.length), [1, 1])
+  assert.equal(inputs.filter(input => JSON.stringify(input).includes(first.attachmentId)).length, 1)
+  assert.equal(inputs.filter(input => JSON.stringify(input).includes(second.attachmentId)).length, 1)
+  assert.ok(inputs.every(input => JSON.stringify(input).length <= 4_000))
+  assert.equal(typeof result.input, 'string')
+  assert.doesNotMatch(result.input, /data:image\/png;base64/)
+  assert.match(result.input, new RegExp(first.attachmentId))
+  assert.match(result.input, new RegExp(second.attachmentId))
+  assert.ok(result.input.length <= 4_000)
+})
+
+test('image compaction fails closed for missing durable history before any model call', async () => {
+  const image = {
+    attachmentId: 'sha256:missing-compaction-image', mediaType: 'image/png', bytes: 3, width: 1, height: 1,
+  }
+  let starts = 0
+  let runs = 0
+  const adapter = new CodexSubscriptionAdapter({
+    models: [{ id: 'gpt-image', inputModalities: ['text', 'image'] }],
+  }, () => ({
+    startThread() {
+      starts += 1
+      return {
+        id: `thread-missing-image-${starts}`,
+        async runStreamed() {
+          runs += 1
+          throw new Error('missing image must fail before model run')
+        },
+      }
+    },
+  }), undefined, undefined, {
+    async readImageRequest() {
+      throw Object.assign(new Error('attachment not found'), { code: 'ATTACHMENT_NOT_FOUND' })
+    },
+  })
+  await assert.rejects(collectStream(adapter, {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-image',
+    purpose: 'compaction',
+    sessionId: 'session-missing-compaction-image',
+    messages: [
+      { id: 'history', role: 'user', content: [{ type: 'image', attachment: image }] },
+      textMessage('instruction', 'summarize the history'),
+    ],
+  }), error => error.code === 'ATTACHMENT_PROJECTION_FAILED'
+    && error.cause?.code === 'ATTACHMENT_NOT_FOUND')
+  assert.equal(starts, 1)
+  assert.equal(runs, 0)
+})
+
+test('segmented compaction rejects a duplicate image reference with conflicting metadata', async () => {
+  const first = {
+    attachmentId: 'sha256:conflicting-image', mediaType: 'image/png', bytes: 3, width: 1, height: 1,
+  }
+  const second = { ...first, width: 2 }
+  let reads = 0
+  let calls = 0
+  const options = {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-image',
+    purpose: 'compaction',
+    messages: [
+      { id: 'one', role: 'user', content: [{ type: 'image', attachment: first }] },
+      { id: 'two', role: 'user', content: [{ type: 'image', attachment: second }] },
+      textMessage('instruction', 'summarize'),
+    ],
+  }
   await assert.rejects(prepareSegmentedCompaction(
     options,
     new AbortController().signal,
     () => {
       calls += 1
-      throw new Error('nested image compaction must fail before creating a thread')
+      throw new Error('conflicting refs must fail before model calls')
     },
-  ), error => error.code === 'ATTACHMENT_COMPACTION_UNSUPPORTED')
+    {
+      model: { id: 'gpt-image', inputModalities: ['text', 'image'] },
+      getAttachments: {
+        async readImageRequest() {
+          reads += 1
+          return { attachment: first, data: Uint8Array.from([1, 2, 3]), mediaType: 'image/png', bytes: 3, width: 1, height: 1 }
+        },
+      },
+    },
+  ), error => error.code === 'ATTACHMENT_PROJECTION_FAILED')
+  assert.equal(reads, 0)
   assert.equal(calls, 0)
+})
+
+test('image compaction rejects an oversized native data URL before model calls', async () => {
+  const image = {
+    attachmentId: 'sha256:oversized-compaction-image', mediaType: 'image/png', bytes: 3, width: 1, height: 1,
+  }
+  let runs = 0
+  const adapter = new CodexSubscriptionAdapter({
+    models: [{ id: 'gpt-image', inputModalities: ['text', 'image'] }],
+  }, () => ({
+    startThread() {
+      return {
+        id: 'thread-oversized-image',
+        async runStreamed() {
+          runs += 1
+          throw new Error('oversized image must fail before run')
+        },
+      }
+    },
+  }), undefined, undefined, {
+    async readImageRequest(ref) {
+      return {
+        attachment: ref,
+        data: new Uint8Array(CODEX_SAFE_PROMPT_CHAR_BUDGET),
+        mediaType: ref.mediaType,
+        bytes: CODEX_SAFE_PROMPT_CHAR_BUDGET,
+        width: ref.width,
+        height: ref.height,
+      }
+    },
+  })
+  await assert.rejects(collectStream(adapter, {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-image',
+    purpose: 'compaction',
+    messages: [
+      { id: 'history', role: 'user', content: [{ type: 'image', attachment: image }] },
+      textMessage('instruction', 'summarize'),
+    ],
+  }), error => error.code === 'CONTEXT_WINDOW_EXCEEDED')
+  assert.equal(runs, 0)
+})
+
+test('image compaction aborts during durable preflight without a model call', async () => {
+  const image = {
+    attachmentId: 'sha256:aborted-compaction-image', mediaType: 'image/png', bytes: 3, width: 1, height: 1,
+  }
+  const controller = new AbortController()
+  let runs = 0
+  const adapter = new CodexSubscriptionAdapter({
+    models: [{ id: 'gpt-image', inputModalities: ['text', 'image'] }],
+  }, () => ({
+    startThread() {
+      return {
+        id: 'thread-aborted-image',
+        async runStreamed() {
+          runs += 1
+          throw new Error('aborted image must fail before run')
+        },
+      }
+    },
+  }), undefined, undefined, {
+    async readImageRequest() {
+      controller.abort()
+      await new Promise(resolve => setImmediate(resolve))
+      throw new Error('read cancelled')
+    },
+  })
+  await assert.rejects(collectStream(adapter, {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-image',
+    purpose: 'compaction',
+    signal: controller.signal,
+    messages: [
+      { id: 'history', role: 'user', content: [{ type: 'image', attachment: image }] },
+      textMessage('instruction', 'summarize'),
+    ],
+  }), error => error.code === 'ABORTED')
+  assert.equal(runs, 0)
+})
+
+test('adapter re-reads durable image refs after an adapter restart', async () => {
+  const image = {
+    attachmentId: 'sha256:restart-image', mediaType: 'image/png', bytes: 3, width: 1, height: 1,
+  }
+  const reads = []
+  const makeAdapter = (label) => new CodexSubscriptionAdapter({
+    models: [{ id: 'gpt-image', inputModalities: ['text', 'image'] }],
+  }, () => ({
+    startThread() {
+      return {
+        id: `thread-${label}`,
+        async runStreamed() {
+          const finalResponse = JSON.stringify({ reasoning: '', text: 'ok', tool_calls: [] })
+          return { events: streamedEvents([finalResponse]) }
+        },
+      }
+    },
+  }), undefined, undefined, {
+    async readImageRequest(ref) {
+      reads.push(label)
+      return {
+        attachment: ref,
+        data: Uint8Array.from([1, 2, 3]),
+        mediaType: ref.mediaType,
+        bytes: 3,
+        width: ref.width,
+        height: ref.height,
+      }
+    },
+  })
+  const options = {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-image',
+    messages: [{ id: 'history', role: 'user', content: [{ type: 'image', attachment: image }] }],
+  }
+  const first = makeAdapter('first')
+  await collectStream(first, options)
+  await first.close()
+  const second = makeAdapter('second')
+  await collectStream(second, options)
+  await second.close()
+  assert.deepEqual(reads, ['first', 'second'])
+})
+
+test('app-server input keeps image data URLs on the native image wire', async () => {
+  const rpc = new FakeAppServerRpc((method) => {
+    if (method !== 'turn/start') return undefined
+    queueMicrotask(() => {
+      const response = JSON.stringify({ reasoning: '', text: 'ok', tool_calls: [] })
+      rpc.emit('item/completed', {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: { type: 'agentMessage', id: 'item-1', text: response },
+      })
+      rpc.emit('turn/completed', {
+        threadId: 'thread-1',
+        turn: { id: 'turn-1', status: 'completed' },
+      })
+    })
+    return { turn: { id: 'turn-1', status: 'inProgress' } }
+  })
+  const client = new CodexAppServerClient(rpc)
+  const thread = client.startThread({ model: 'gpt-image' })
+  const stream = await thread.runStreamed([
+    { type: 'text', text: 'image prompt' },
+    { type: 'image', url: 'data:image/png;base64,AQID' },
+  ])
+  await collectIterable(stream.events)
+  await new Promise(resolve => setImmediate(resolve))
+  const turn = rpc.calls.find(call => call.method === 'turn/start')
+  assert.deepEqual(turn.params.input, [
+    { type: 'text', text: 'image prompt', text_elements: [] },
+    { type: 'image', url: 'data:image/png;base64,AQID' },
+  ])
+  await client.close()
 })
 
 test('tool-call argument slices retain paired ids and reconstruct valid JSON', () => {
@@ -2815,6 +3396,516 @@ test('outer repair with unexpected tool calls emits cumulative usage exactly onc
   assert.equal(failure.chunks.some(chunk => chunk.type === 'tool-call-delta'), false)
 })
 
+test('adapter carries only hashed lineage metadata in the assistant replay state', async () => {
+  const secret = 'do-not-persist-this-prompt'
+  const adapter = new CodexSubscriptionAdapter({}, () => ({
+    startThread() {
+      return {
+        id: 'thread-replay-metadata',
+        async runStreamed() {
+          const finalResponse = JSON.stringify({ reasoning: '', text: 'done', tool_calls: [] })
+          return { events: streamedEvents([finalResponse]) }
+        },
+      }
+    },
+  }))
+  const chunks = await collectStream(adapter, {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-5.6-sol',
+    reasoningEffort: 'medium',
+    sessionId: 'session-replay-metadata',
+    system: secret,
+    messages: [textMessage('replay-user-1', secret)],
+  })
+  const finish = chunks.at(-1)
+  assert.equal(finish.type, 'finish')
+  assert.equal(finish.replayState.response.kind, CODEX_REPLAY_STATE_KIND)
+  assert.equal(finish.replayState.response.version, CODEX_REPLAY_STATE_VERSION)
+  assert.equal(finish.replayState.response.provider, CODEX_PROVIDER)
+  assert.equal(finish.replayState.response.model, 'gpt-5.6-sol')
+  assert.equal(finish.replayState.response.sessionId, 'session-replay-metadata')
+  assert.equal(finish.replayState.response.threadId, 'thread-replay-metadata')
+  assert.equal(finish.replayState.response.assistantCursor, 1)
+  assert.equal(typeof finish.replayState.response.threadSignature, 'string')
+  assert.equal(typeof finish.replayState.response.contextKey, 'string')
+  assert.equal(typeof finish.replayState.response.assistantFingerprint, 'string')
+  assert.equal(typeof finish.replayState.response.lineagePrefixFingerprint, 'string')
+  assert.equal(typeof finish.replayState.response.savedAt, 'number')
+  assert.equal(Object.hasOwn(finish.replayState, 'blocks'), false)
+  assert.equal(JSON.stringify(finish.replayState).includes(secret), false)
+})
+
+test('adapter rejects unknown, versioned, flattened, and source-mismatched replay state', async () => {
+  const firstAdapter = new CodexSubscriptionAdapter({}, () => ({
+    startThread() {
+      return {
+        id: 'thread-invalid-replay-state',
+        async runStreamed() {
+          const finalResponse = JSON.stringify({ reasoning: '', text: 'done', tool_calls: [] })
+          return { events: streamedEvents([finalResponse]) }
+        },
+      }
+    },
+  }))
+  const firstOptions = {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-5.6-sol',
+    reasoningEffort: 'medium',
+    sessionId: 'session-invalid-replay-state',
+    messages: [textMessage('invalid-replay-user-1', 'hello')],
+  }
+  const replayState = (await collectStream(firstAdapter, firstOptions)).at(-1).replayState
+  const baseResponse = replayState.response
+  await firstAdapter.close()
+
+  const cases = [
+    {
+      name: 'unknown-kind',
+      replay: { response: { ...baseResponse, kind: 'other-adapter' } },
+      sourceModel: firstOptions.model,
+      requestModel: firstOptions.model,
+    },
+    {
+      name: 'unknown-version',
+      replay: { response: { ...baseResponse, version: CODEX_REPLAY_STATE_VERSION + 1 } },
+      sourceModel: firstOptions.model,
+      requestModel: firstOptions.model,
+    },
+    {
+      name: 'flattened',
+      replay: { ...baseResponse },
+      sourceModel: firstOptions.model,
+      requestModel: firstOptions.model,
+    },
+    {
+      name: 'flattened-without-kind',
+      replay: { ...baseResponse, kind: undefined },
+      sourceModel: firstOptions.model,
+      requestModel: firstOptions.model,
+    },
+    {
+      name: 'source-model-mismatch',
+      replay: replayState,
+      sourceModel: 'gpt-5.6-luna',
+      requestModel: firstOptions.model,
+    },
+    {
+      name: 'request-model-mismatch',
+      replay: replayState,
+      sourceModel: firstOptions.model,
+      requestModel: 'gpt-5.6-luna',
+    },
+  ]
+  for (const testCase of cases) {
+    let resumes = 0
+    let starts = 0
+    const adapter = new CodexSubscriptionAdapter({}, () => ({
+      resumeThread() {
+        resumes += 1
+        throw new Error(`unexpected resume in ${testCase.name} case`)
+      },
+      startThread() {
+        starts += 1
+        return {
+          id: `thread-${testCase.name}`,
+          async runStreamed() {
+            const finalResponse = JSON.stringify({ reasoning: '', text: 'fresh', tool_calls: [] })
+            return { events: streamedEvents([finalResponse]) }
+          },
+        }
+      },
+    }))
+    await collectStream(adapter, {
+      ...firstOptions,
+      model: testCase.requestModel,
+      messages: [
+        ...firstOptions.messages,
+        replayAssistantMessage(
+          `invalid-replay-assistant-${testCase.name}`,
+          'done',
+          testCase.sourceModel,
+          testCase.replay,
+        ),
+        textMessage(`invalid-replay-user-2-${testCase.name}`, 'next'),
+      ],
+    })
+    assert.equal(resumes, 0, `${testCase.name} should not resume`)
+    assert.equal(starts, 1, `${testCase.name} should start a fresh thread`)
+    await adapter.close()
+  }
+})
+
+test('adapter resumes a persisted Codex thread after a new adapter instance', async () => {
+  const firstAdapter = new CodexSubscriptionAdapter({}, () => ({
+    startThread() {
+      return {
+        id: 'thread-restart',
+        async runStreamed() {
+          const finalResponse = JSON.stringify({ reasoning: '', text: 'done', tool_calls: [] })
+          return { events: streamedEvents([finalResponse]) }
+        },
+      }
+    },
+  }))
+  const firstOptions = {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-5.6-sol',
+    reasoningEffort: 'medium',
+    sessionId: 'session-restart',
+    system: 'system',
+    messages: [textMessage('restart-user-1', 'hello')],
+  }
+  const firstChunks = await collectStream(firstAdapter, firstOptions)
+  const replayState = firstChunks.at(-1).replayState
+  assert.equal(replayState.response.threadId, 'thread-restart')
+  await firstAdapter.close()
+
+  const resumed = []
+  const prompts = []
+  const secondAdapter = new CodexSubscriptionAdapter({}, () => ({
+    startThread() {
+      throw new Error('persisted thread must not start a new thread before resume')
+    },
+    resumeThread(threadId, options) {
+      resumed.push({ threadId, options })
+      return {
+        id: threadId,
+        async ensureThread() {},
+        async runStreamed(prompt) {
+          prompts.push(prompt)
+          const finalResponse = JSON.stringify({ reasoning: '', text: 'continued', tool_calls: [] })
+          return { events: streamedEvents([finalResponse]) }
+        },
+      }
+    },
+  }))
+  await collectStream(secondAdapter, {
+    ...firstOptions,
+    messages: [
+      ...firstOptions.messages,
+      replayAssistantMessage('restart-assistant-1', 'done', firstOptions.model, replayState),
+      textMessage('restart-user-2', 'next'),
+    ],
+  })
+
+  assert.deepEqual(resumed.map(call => call.threadId), ['thread-restart'])
+  assert.equal(prompts.length, 1)
+  const payload = JSON.parse(prompts[0].slice(prompts[0].lastIndexOf('\n') + 1))
+  assert.deepEqual(payload, {
+    messages: [{
+      role: 'user',
+      content: [{ type: 'text', text: 'next' }],
+    }],
+    generation: { max_tokens: null },
+  })
+  await secondAdapter.close()
+})
+
+test('adapter falls back to a fresh thread for a raw no-rollout resume error', async () => {
+  const firstAdapter = new CodexSubscriptionAdapter({}, () => ({
+    startThread() {
+      return {
+        id: 'thread-expired',
+        async runStreamed() {
+          const finalResponse = JSON.stringify({ reasoning: '', text: 'done', tool_calls: [] })
+          return { events: streamedEvents([finalResponse]) }
+        },
+      }
+    },
+  }))
+  const firstOptions = {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-5.6-sol',
+    reasoningEffort: 'medium',
+    sessionId: 'session-expired',
+    system: 'system',
+    messages: [textMessage('expired-user-1', 'hello')],
+  }
+  const firstChunks = await collectStream(firstAdapter, firstOptions)
+  const replayState = firstChunks.at(-1).replayState
+  await firstAdapter.close()
+
+  const resumes = []
+  const starts = []
+  const prompts = []
+  const secondAdapter = new CodexSubscriptionAdapter({}, () => ({
+    resumeThread(threadId) {
+      resumes.push(threadId)
+      return {
+        id: threadId,
+        async ensureThread() {
+          throw Object.assign(new Error('no rollout found'), {
+            code: -32600,
+            method: 'thread/resume',
+          })
+        },
+        async runStreamed() {
+          throw new Error('expired resume must not run')
+        },
+      }
+    },
+    startThread() {
+      const threadId = `thread-fresh-${starts.length + 1}`
+      starts.push(threadId)
+      return {
+        id: threadId,
+        async ensureThread() {},
+        async runStreamed(prompt) {
+          prompts.push(prompt)
+          const finalResponse = JSON.stringify({ reasoning: '', text: 'fresh', tool_calls: [] })
+          return { events: streamedEvents([finalResponse]) }
+        },
+      }
+    },
+  }))
+  await collectStream(secondAdapter, {
+    ...firstOptions,
+    messages: [
+      ...firstOptions.messages,
+      replayAssistantMessage('expired-assistant-1', 'done', firstOptions.model, replayState),
+      textMessage('expired-user-2', 'next'),
+    ],
+  })
+
+  assert.deepEqual(resumes, ['thread-expired'])
+  assert.deepEqual(starts, ['thread-fresh-1'])
+  const payload = JSON.parse(prompts[0].slice(prompts[0].lastIndexOf('\n') + 1))
+  assert.equal(payload.system, 'system')
+  assert.equal(payload.messages.length, 3)
+  assert.equal(payload.messages[0].content[0].text, 'hello')
+  assert.equal(payload.messages[2].content[0].text, 'next')
+  await secondAdapter.close()
+})
+
+test('adapter does not hide a global app-server failure as a fresh thread', async () => {
+  const firstAdapter = new CodexSubscriptionAdapter({}, () => ({
+    startThread() {
+      return {
+        id: 'thread-global-failure',
+        async runStreamed() {
+          const finalResponse = JSON.stringify({ reasoning: '', text: 'done', tool_calls: [] })
+          return { events: streamedEvents([finalResponse]) }
+        },
+      }
+    },
+  }))
+  const firstOptions = {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-5.6-sol',
+    reasoningEffort: 'medium',
+    sessionId: 'session-global-failure',
+    messages: [textMessage('global-failure-user-1', 'hello')],
+  }
+  const firstChunks = await collectStream(firstAdapter, firstOptions)
+  const replayState = firstChunks.at(-1).replayState
+  await firstAdapter.close()
+
+  let starts = 0
+  const secondAdapter = new CodexSubscriptionAdapter({}, () => ({
+    resumeThread(threadId) {
+      assert.equal(threadId, 'thread-global-failure')
+      return {
+        id: threadId,
+        async ensureThread() {
+          throw Object.assign(new Error('Codex app-server exited'), { code: 'APP_SERVER_EXIT' })
+        },
+        async runStreamed() {
+          throw new Error('global resume failure must not run')
+        },
+      }
+    },
+    startThread() {
+      starts += 1
+      throw new Error('global resume failure must not start a new thread')
+    },
+  }))
+  const failure = await collectStreamFailure(secondAdapter, {
+    ...firstOptions,
+    messages: [
+      ...firstOptions.messages,
+      replayAssistantMessage('global-failure-assistant-1', 'done', firstOptions.model, replayState),
+      textMessage('global-failure-user-2', 'next'),
+    ],
+  })
+  assert.equal(failure.error.code, 'SERVER')
+  assert.equal(starts, 0)
+  await secondAdapter.close()
+})
+
+test('adapter does not treat an unknown -32600 resume failure as a stale thread', async () => {
+  const firstAdapter = new CodexSubscriptionAdapter({}, () => ({
+    startThread() {
+      return {
+        id: 'thread-backend-exploded',
+        async runStreamed() {
+          const finalResponse = JSON.stringify({ reasoning: '', text: 'done', tool_calls: [] })
+          return { events: streamedEvents([finalResponse]) }
+        },
+      }
+    },
+  }))
+  const firstOptions = {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-5.6-sol',
+    reasoningEffort: 'medium',
+    sessionId: 'session-backend-exploded',
+    messages: [textMessage('backend-exploded-user-1', 'hello')],
+  }
+  const firstChunks = await collectStream(firstAdapter, firstOptions)
+  const replayState = firstChunks.at(-1).replayState
+  await firstAdapter.close()
+
+  let starts = 0
+  const secondAdapter = new CodexSubscriptionAdapter({}, () => ({
+    resumeThread(threadId) {
+      assert.equal(threadId, 'thread-backend-exploded')
+      return {
+        id: threadId,
+        async ensureThread() {
+          throw Object.assign(new Error('backend exploded'), {
+            code: -32600,
+            method: 'thread/resume',
+          })
+        },
+        async runStreamed() {
+          throw new Error('unknown resume failure must not run')
+        },
+      }
+    },
+    startThread() {
+      starts += 1
+      throw new Error('unknown resume failure must not start a new thread')
+    },
+  }))
+  const failure = await collectStreamFailure(secondAdapter, {
+    ...firstOptions,
+    messages: [
+      ...firstOptions.messages,
+      replayAssistantMessage('backend-exploded-assistant-1', 'done', firstOptions.model, replayState),
+      textMessage('backend-exploded-user-2', 'next'),
+    ],
+  })
+  assert.equal(failure.error.code, 'CODEX_SDK')
+  assert.match(failure.error.message, /backend exploded/)
+  assert.equal(starts, 0)
+  await secondAdapter.close()
+})
+
+test('adapter does not resume persisted threads across history or runtime changes', async () => {
+  const baseConfig = { workingDirectory: '/tmp/replay', allowNetworkAccess: false }
+  const firstAdapter = new CodexSubscriptionAdapter(baseConfig, () => ({
+    startThread() {
+      return {
+        id: 'thread-isolated-replay',
+        async runStreamed() {
+          const finalResponse = JSON.stringify({ reasoning: '', text: 'done', tool_calls: [] })
+          return { events: streamedEvents([finalResponse]) }
+        },
+      }
+    },
+  }))
+  const firstOptions = {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-5.6-sol',
+    reasoningEffort: 'medium',
+    sessionId: 'session-isolated-replay',
+    system: 'system',
+    messages: [textMessage('isolated-user-1', 'hello')],
+  }
+  const firstChunks = await collectStream(firstAdapter, firstOptions)
+  const replayState = firstChunks.at(-1).replayState
+  await firstAdapter.close()
+
+  const cases = [
+    {
+      name: 'history',
+      config: baseConfig,
+      options: {
+        ...firstOptions,
+        messages: [
+          textMessage('isolated-user-edited', 'changed'),
+          replayAssistantMessage('isolated-assistant-1', 'done', firstOptions.model, replayState),
+          textMessage('isolated-user-2', 'next'),
+        ],
+      },
+    },
+    {
+      name: 'model',
+      config: baseConfig,
+      options: {
+        ...firstOptions,
+        model: 'gpt-5.6-luna',
+        messages: [
+          ...firstOptions.messages,
+          replayAssistantMessage('isolated-assistant-1', 'done', firstOptions.model, replayState),
+          textMessage('isolated-user-2', 'next'),
+        ],
+      },
+    },
+    {
+      name: 'effort',
+      config: baseConfig,
+      options: {
+        ...firstOptions,
+        reasoningEffort: 'high',
+        messages: [
+          ...firstOptions.messages,
+          replayAssistantMessage('isolated-assistant-1', 'done', firstOptions.model, replayState),
+          textMessage('isolated-user-2', 'next'),
+        ],
+      },
+    },
+    {
+      name: 'network',
+      config: { ...baseConfig, allowNetworkAccess: true },
+      options: {
+        ...firstOptions,
+        messages: [
+          ...firstOptions.messages,
+          replayAssistantMessage('isolated-assistant-1', 'done', firstOptions.model, replayState),
+          textMessage('isolated-user-2', 'next'),
+        ],
+      },
+    },
+    {
+      name: 'directory',
+      config: { ...baseConfig, workingDirectory: '/tmp/other-replay' },
+      options: {
+        ...firstOptions,
+        messages: [
+          ...firstOptions.messages,
+          replayAssistantMessage('isolated-assistant-1', 'done', firstOptions.model, replayState),
+          textMessage('isolated-user-2', 'next'),
+        ],
+      },
+    },
+  ]
+  for (const testCase of cases) {
+    let resumes = 0
+    let starts = 0
+    const adapter = new CodexSubscriptionAdapter(testCase.config, () => ({
+      resumeThread() {
+        resumes += 1
+        throw new Error(`unexpected resume in ${testCase.name} case`)
+      },
+      startThread() {
+        starts += 1
+        return {
+          id: `thread-${testCase.name}`,
+          async runStreamed() {
+            const finalResponse = JSON.stringify({ reasoning: '', text: 'fresh', tool_calls: [] })
+            return { events: streamedEvents([finalResponse]) }
+          },
+        }
+      },
+    }))
+    await collectStream(adapter, testCase.options)
+    assert.equal(resumes, 0, `${testCase.name} should not resume`)
+    assert.equal(starts, 1, `${testCase.name} should start a fresh thread`)
+    await adapter.close()
+  }
+})
+
 test('adapter reuses an append-only DSH session thread and sends only new messages', async () => {
   const starts = []
   const adapter = new CodexSubscriptionAdapter(
@@ -3512,9 +4603,11 @@ test('adapter invalidates a failed thread before retrying the same request', asy
 
 test('adapter handles auxiliary purposes outside the main session pool', async () => {
   let starts = 0
+  const threadOptions = []
   const adapter = new CodexSubscriptionAdapter({}, () => ({
-    startThread() {
+    startThread(options) {
       starts += 1
+      threadOptions.push(options)
       return {
         id: `thread-${starts}`,
         async runStreamed() {
@@ -3549,14 +4642,17 @@ test('adapter handles auxiliary purposes outside the main session pool', async (
   })
 
   assert.equal(starts, 4)
+  assert.deepEqual(threadOptions.map(options => options.ephemeral), [false, true, true, false])
 })
 
 test('adapter segments an oversized compaction request and emits one cumulative usage event', async () => {
   const prompts = []
+  const threadOptions = []
   let starts = 0
   const adapter = new CodexSubscriptionAdapter({}, () => ({
-    startThread() {
+    startThread(options) {
       starts += 1
+      threadOptions.push(options)
       return {
         id: `thread-${starts}`,
         async runStreamed(prompt) {
@@ -3588,6 +4684,7 @@ test('adapter segments an oversized compaction request and emits one cumulative 
 
   const chunks = await collectStream(adapter, options)
   assert.ok(starts > 2)
+  assert.ok(threadOptions.every(options => options.ephemeral === true))
   assert.ok(prompts.every(prompt => prompt.length <= CODEX_SAFE_PROMPT_CHAR_BUDGET))
   assert.equal(chunks.filter(chunk => chunk.type === 'usage').length, 1)
   assert.deepEqual(chunks.find(chunk => chunk.type === 'usage').usage, {
@@ -3975,7 +5072,8 @@ test('client exposes Codex model controls in plugin configuration', async () => 
   const server = await readFile(new URL('../index.js', import.meta.url), 'utf8')
   assert.match(client, /settings\.plugin\.item/)
   assert.match(client, /const inject = \["slots", "connection"\]/)
-  assert.match(client, /工作目录/)
+	assert.doesNotMatch(client, /工作目录/)
+	assert.match(client, /独立登录域/)
   assert.match(client, /允许 Codex 访问网络/)
   assert.match(client, /上下文窗口/)
   assert.match(client, /默认推理强度/)
