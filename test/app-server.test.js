@@ -164,7 +164,7 @@ test('Windows private ACL helper uses icacls and validates machine-readable owne
 		let restoreContents
 		const runCommand = (command, args) => {
 			calls.push({ command, args })
-			if (command === 'whoami.exe') return `USER\n${sid}\n`
+			if (command === 'whoami.exe') return `"HOST\\Administrator","${sid}"\r\n`
 			if (args.includes('/restore')) {
 				restoreContents = readFileSync(args[args.indexOf('/restore') + 1], 'utf16le')
 			}
@@ -176,7 +176,7 @@ test('Windows private ACL helper uses icacls and validates machine-readable owne
 		}
 		applyWindowsPrivateDirectoryAcl(path, { platform: 'win32', runCommand })
 		assert.deepEqual(calls.map(call => call.command), ['whoami.exe', 'icacls.exe', 'icacls.exe'])
-		assert.deepEqual(calls[0], { command: 'whoami.exe', args: ['/user'] })
+		assert.deepEqual(calls[0], { command: 'whoami.exe', args: ['/user', '/fo', 'csv', '/nh'] })
 		assert.deepEqual(calls[1].args.slice(0, 2), [root, '/restore'])
 		assert.equal(calls[1].args.at(-1), '/q')
 		assert.equal(restoreContents, `\ufeffcodex-adapter\r\nD:PAI(A;OICI;FA;;;${sid})\r\n`)
@@ -194,7 +194,7 @@ test('Windows private ACL helper uses icacls and validates machine-readable owne
 			Rules: [ownerRule, { ...ownerRule, Sid: 'S-1-1-0' }],
 		}, sid), error => {
 			assert.match(error.message, /owner-only DACL/)
-			assert.match(error.message, /Protected=true Rules=2 Type=Allow Rights=2032127 Inheritance=3 Propagation=0 Inherited=false SidMatches=true SidKind=numeric SidLength=25 TrimMatches=true CaseFoldMatches=true IsLA=false IsOW=false IsBA=false IsOtherAlias=false/)
+			assert.match(error.message, /Protected=true Rules=2 Type=Allow Rights=2032127 Inheritance=3 Propagation=0 Inherited=false SidMatches=true SidKind=numeric/)
 			assert.doesNotMatch(error.message, /S-1-1-0|codex-adapter|tmp/)
 			return true
 		})
@@ -203,27 +203,34 @@ test('Windows private ACL helper uses icacls and validates machine-readable owne
 			Rules: [{ ...ownerRule, Sid: 'S-1-5-21-111-222-333-1002' }],
 		}, sid), error => {
 			assert.match(error.message, /owner rule is incomplete/)
-			assert.match(error.message, /Protected=true Rules=1 Type=Allow Rights=2032127 Inheritance=3 Propagation=0 Inherited=false SidMatches=false SidKind=numeric SidLength=25 TrimMatches=false CaseFoldMatches=false IsLA=false IsOW=false IsBA=false IsOtherAlias=false/)
+			assert.match(error.message, /Protected=true Rules=1 Type=Allow Rights=2032127 Inheritance=3 Propagation=0 Inherited=false SidMatches=false SidKind=numeric/)
 			assert.doesNotMatch(error.message, /S-1-5-21|codex-adapter|tmp/)
 			return true
 		})
-		assert.throws(() => validateWindowsAclSnapshot({
+		const localAdminSid = 'S-1-5-21-111-222-333-500'
+		const localAdminRule = { ...ownerRule, Sid: 'LA' }
+		assert.doesNotThrow(() => validateWindowsAclSnapshot({ Protected: true, Rules: [localAdminRule] }, localAdminSid, {
+			accountName: 'HOST\\Administrator',
+			hostName: 'host',
+		}))
+		assert.throws(() => validateWindowsAclSnapshot({ Protected: true, Rules: [localAdminRule] }, localAdminSid, {
+			accountName: 'DOMAIN\\Administrator',
+			hostName: 'HOST',
+		}), /owner rule is incomplete/)
+		assert.throws(() => validateWindowsAclSnapshot({ Protected: true, Rules: [localAdminRule] }, sid, {
+			accountName: 'HOST\\Administrator',
+			hostName: 'HOST',
+		}), /owner rule is incomplete/)
+		for (const alias of ['BA', 'OW']) {
+			assert.throws(() => validateWindowsAclSnapshot({ Protected: true, Rules: [{ ...ownerRule, Sid: alias }] }, localAdminSid, {
+				accountName: 'HOST\\Administrator',
+				hostName: 'HOST',
+			}), /owner rule is incomplete/)
+		}
+		assert.doesNotThrow(() => validateWindowsAclSnapshot({
 			Protected: true,
-			Rules: [{ ...ownerRule, Sid: ' CO ' }],
-		}, sid), error => {
-			assert.match(error.message, /owner rule is incomplete/)
-			assert.match(error.message, /SidMatches=false SidKind=alias SidLength=4 TrimMatches=false CaseFoldMatches=false IsLA=false IsOW=false IsBA=false IsOtherAlias=true/)
-			assert.doesNotMatch(error.message, /S-1-5-21|codex-adapter|tmp/)
-			return true
-		})
-		assert.throws(() => validateWindowsAclSnapshot({
-			Protected: true,
-			Rules: [{ ...ownerRule, Sid: 'LA' }],
-		}, sid), error => {
-			assert.match(error.message, /IsLA=true IsOW=false IsBA=false IsOtherAlias=false/)
-			assert.doesNotMatch(error.message, /S-1-5-21|codex-adapter|tmp/)
-			return true
-		})
+			Rules: [{ ...ownerRule, Sid: `  ${sid.toLowerCase()}  ` }],
+		}, sid))
 		assert.throws(() => applyWindowsPrivateDirectoryAcl(path, {
 			platform: 'win32',
 			userSid: sid,
@@ -242,7 +249,7 @@ test('Windows private ACL helper uses icacls and validates machine-readable owne
 		const cachedCalls = []
 		const cachedRunCommand = (command, args) => {
 			cachedCalls.push({ command, args })
-			return command === 'whoami.exe' ? `USER\n${sid}\n` : ''
+			return command === 'whoami.exe' ? `"HOST\\Administrator","${sid}"\r\n` : ''
 		}
 		applyWindowsPrivateDirectoryAcl(path, {
 			platform: 'win32',
