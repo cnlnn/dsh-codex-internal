@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { EventEmitter, getEventListeners } from 'node:events'
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -475,6 +475,78 @@ test('times out one request without leaving pending state', async () => {
 	await assert.rejects(promise, error => error.code === 'TIMEOUT' && /timed out/.test(error.message))
 	assert.equal(rpc.diagnostics.pending, 0)
 	rpc.close()
+})
+
+test('RPC and initialization deadlines stay live without unrelated ref handles', () => {
+	const moduleUrl = new URL('../lib/app-server.js', import.meta.url).href
+	const script = `
+    import { EventEmitter } from 'node:events'
+    import { CodexAppServerRpc } from ${JSON.stringify(moduleUrl)}
+
+    class Stream extends EventEmitter {
+      setEncoding() {}
+    }
+    class Child extends EventEmitter {
+      constructor(replyToInitialize) {
+        super()
+        this.pid = 1
+        this.stdout = new Stream()
+        this.stderr = new Stream()
+        this.stdin = {
+          write: line => {
+            const message = JSON.parse(line)
+            if (replyToInitialize && message.method === 'initialize') {
+              this.stdout.emit('data', JSON.stringify({ id: message.id, result: {} }) + '\\n')
+            }
+          },
+        }
+      }
+      kill() {}
+      unref() {}
+    }
+
+    const initializedChild = new Child(true)
+    const initializedRpc = new CodexAppServerRpc({
+      spawn: () => initializedChild,
+      initializeTimeoutMs: 100,
+    })
+    try {
+      await initializedRpc.request('never-answered', {}, { timeoutMs: 10 })
+      process.stdout.write('UNEXPECTED_RPC_RESOLUTION\\n')
+      process.exitCode = 2
+    } catch (error) {
+      process.stdout.write(String(error?.code ?? 'UNKNOWN') + '\\n')
+      if (error?.code !== 'TIMEOUT') process.exitCode = 3
+    }
+    initializedRpc.close()
+
+    const stuckChild = new Child(false)
+    const stuckRpc = new CodexAppServerRpc({
+      spawn: () => stuckChild,
+      initializeTimeoutMs: 10,
+    })
+    try {
+      await stuckRpc.request('blocked-by-initialize', {}, { timeoutMs: 100 })
+      process.stdout.write('UNEXPECTED_INITIALIZE_RESOLUTION\\n')
+      process.exitCode = 4
+    } catch (error) {
+      process.stdout.write(String(error?.code ?? 'UNKNOWN') + '\\n')
+      if (error?.code !== 'INITIALIZE_TIMEOUT') process.exitCode = 5
+    }
+    stuckRpc.close()
+  `
+	const result = spawnSync(process.execPath, [
+		'--unhandled-rejections=strict',
+		'--input-type=module',
+		'--eval',
+		script,
+	], {
+		cwd: process.cwd(),
+		encoding: 'utf8',
+		timeout: 1_000,
+	})
+	assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+	assert.deepEqual(result.stdout.trim().split(/\r?\n/), ['TIMEOUT', 'INITIALIZE_TIMEOUT'])
 })
 
 test('initialize timeout kills the stuck child and allows a later respawn', async () => {

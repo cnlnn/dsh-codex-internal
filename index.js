@@ -3051,6 +3051,8 @@ export class CodexAppServerThread {
       }
       const timeoutMs = turnOptions.timeoutMs ?? 30_000
       if (typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) && timeoutMs >= 0) {
+        // This deadline rejects the caller's pending stream, so keep it
+        // referenced until the stream settles and the finally block clears it.
         startTimer = setTimeout(() => {
           if (startSettled || callerFailure !== undefined) return
           timedOut = true
@@ -3059,7 +3061,6 @@ export class CodexAppServerThread {
           queue.close(callerFailure)
           rejectStartFailure(callerFailure)
         }, timeoutMs)
-        if (typeof startTimer.unref === 'function') startTimer.unref()
       }
       if (signal?.aborted === true) onAbort()
       if (callerFailure !== undefined) throw callerFailure

@@ -1284,6 +1284,62 @@ test('strict unhandled-rejection mode handles an abort queued by thread/start', 
   assert.doesNotMatch(result.stderr, /UnhandledPromiseRejection|unhandled rejection/i)
 })
 
+test('local turn/start timeout stays live without unrelated ref handles', () => {
+  const indexUrl = new URL('../index.js', import.meta.url).href
+  const script = `
+    import { CodexAppServerClient } from ${JSON.stringify(indexUrl)}
+
+    const start = new Promise(() => {})
+    const listeners = new Map()
+    const rpc = {
+      generation: 1,
+      diagnostics: { pid: 7, initialized: true },
+      closed: false,
+      subscribe(method, callback) {
+        let handlers = listeners.get(method)
+        if (handlers === undefined) {
+          handlers = new Set()
+          listeners.set(method, handlers)
+        }
+        handlers.add(callback)
+        return () => handlers.delete(callback)
+      },
+      request(method) {
+        if (method === 'thread/start') return Promise.resolve({ thread: { id: 'thread-timeout' } })
+        if (method === 'turn/start') return start
+        return Promise.resolve({})
+      },
+      close() {
+        this.closed = true
+      },
+    }
+
+    const client = new CodexAppServerClient({ rpc })
+    const thread = client.startThread({ model: 'gpt-5.6-sol' })
+    const streamed = await thread.runStreamed('timeout without handles', { timeoutMs: 10, wireTimeoutMs: 50 })
+    try {
+      await streamed.events.next()
+      process.stdout.write('UNEXPECTED_RESOLUTION\\n')
+      process.exitCode = 2
+    } catch (error) {
+      process.stdout.write(String(error?.code ?? 'UNKNOWN') + '\\n')
+      if (error?.code !== 'TIMEOUT') process.exitCode = 3
+    }
+  `
+  const result = spawnSync(process.execPath, [
+    '--unhandled-rejections=strict',
+    '--input-type=module',
+    '--eval',
+    script,
+  ], {
+    cwd: process.cwd(),
+    encoding: 'utf8',
+    timeout: 1_000,
+  })
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.equal(result.stdout.trim(), 'TIMEOUT')
+})
+
 test('app-server adapter keeps a late turn/start alive and interrupts once after early abort', async () => {
   const controller = new AbortController()
   const start = deferred()
