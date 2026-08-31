@@ -66,15 +66,15 @@
 
 ### GitHub Release（推荐）
 
-Release 资产是跨平台的 npm tarball，不发布到 npm。`dsh plugin` 会通过 `pnpm` 安装锁定的运行时依赖，并按目标系统和架构解析官方 Codex 对应的 native optional package。`v0.8.3` 的资产文件名为：
+Release 资产是跨平台的 npm tarball，不发布到 npm。`dsh plugin` 会通过 `pnpm` 安装锁定的运行时依赖，并按目标系统和架构解析官方 Codex 对应的 native optional package。`v0.8.4` 的资产文件名为：
 
-`local-dsh-codex-adapter-0.8.3.tgz`
+`local-dsh-codex-adapter-0.8.4.tgz`
 
 macOS/Linux：
 
 ```sh
 dsh plugin --profile web add --save-exact \
-  "https://github.com/cnlnn/dsh-codex-adapter/releases/download/v0.8.3/local-dsh-codex-adapter-0.8.3.tgz"
+  "https://github.com/cnlnn/dsh-codex-adapter/releases/download/v0.8.4/local-dsh-codex-adapter-0.8.4.tgz"
 dsh --profile web --dump-config
 # Bundle 发生变化后需要重启 DSH Web Profile。
 dsh web --no-open
@@ -84,7 +84,7 @@ Windows PowerShell：
 
 ```powershell
 dsh plugin --profile web add --save-exact `
-  "https://github.com/cnlnn/dsh-codex-adapter/releases/download/v0.8.3/local-dsh-codex-adapter-0.8.3.tgz"
+  "https://github.com/cnlnn/dsh-codex-adapter/releases/download/v0.8.4/local-dsh-codex-adapter-0.8.4.tgz"
 dsh --profile web --dump-config
 dsh web --no-open
 ```
@@ -92,8 +92,8 @@ dsh web --no-open
 需要审计安装时，可从同一个 Release 下载 `SHA256SUMS`，校验 tarball 后再通过本地 `file:` URL 安装：
 
 ```sh
-curl -fLO https://github.com/cnlnn/dsh-codex-adapter/releases/download/v0.8.3/local-dsh-codex-adapter-0.8.3.tgz
-curl -fLO https://github.com/cnlnn/dsh-codex-adapter/releases/download/v0.8.3/SHA256SUMS
+curl -fLO https://github.com/cnlnn/dsh-codex-adapter/releases/download/v0.8.4/local-dsh-codex-adapter-0.8.4.tgz
+curl -fLO https://github.com/cnlnn/dsh-codex-adapter/releases/download/v0.8.4/SHA256SUMS
 ```
 
 Linux 校验：
@@ -112,7 +112,7 @@ shasum -a 256 --check SHA256SUMS
 
 ```sh
 dsh plugin --profile web add --save-exact \
-  "file:$PWD/local-dsh-codex-adapter-0.8.3.tgz"
+  "file:$PWD/local-dsh-codex-adapter-0.8.4.tgz"
 ```
 
 Release 工作流只上传两个资产：插件 tarball 和 `SHA256SUMS`。升级时，对新的 Release URL 再执行 `dsh plugin --profile web add --save-exact`，然后重启 Profile。无需编辑 `settings.yaml`；配置仍在 `设置 → 插件 → 插件配置 → Codex` 中完成。

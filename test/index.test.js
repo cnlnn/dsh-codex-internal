@@ -596,8 +596,11 @@ test('context overflow classification is conservative and keeps the original cau
   assert.equal(classifySdkError({ status: 400, message: 'server error' }).code, 'CODEX_SDK')
   assert.equal(classifySdkError({ status: 400, message: 'request timed out' }).code, 'CODEX_SDK')
   assert.equal(classifySdkError({ status: 400, message: 'socket closed' }).code, 'CODEX_SDK')
-  assert.equal(classifySdkError({ status: 401, message: 'server error' }).code, 'AUTH')
-  assert.equal(classifySdkError({ status: 403, message: 'connection closed' }).code, 'AUTH')
+  for (const status of [401, 403]) {
+    const classifiedAuth = classifySdkError({ status, message: 'provider authentication failed' })
+    assert.equal(classifiedAuth.code, 'AUTH_REQUIRED')
+    assert.match(classifiedAuth.message, /^Codex ChatGPT is not signed in\./)
+  }
   assert.equal(classifySdkError({ status: 404, message: 'service unavailable' }).code, 'CODEX_SDK')
   assert.equal(classifySdkError({ status: 422, message: 'request timed out' }).code, 'CODEX_SDK')
   assert.equal(classifySdkError({ status: 429, message: 'rate limit reached' }).code, 'RATE_LIMIT')
@@ -642,9 +645,47 @@ test('context overflow classification is conservative and keeps the original cau
   }
   assert.equal(classifySdkError(new Error('CLI premature exit')).code, 'SERVER')
   assert.equal(classifySdkError(new Error('Codex CLI process exited prematurely')).code, 'SERVER')
-  assert.equal(classifySdkError(new Error('authentication request reset')).code, 'AUTH')
+  const genericAuth = classifySdkError(new Error('authentication request reset'))
+  assert.equal(genericAuth.code, 'AUTH_REQUIRED')
+  assert.match(genericAuth.message, /^Codex ChatGPT is not signed in\./)
   assert.equal(classifySdkError({ code: 'PROTOCOL', message: 'malformed response' }).code, 'PROTOCOL')
   assert.equal(classifySdkError(new Error('invalid JSON response')).code, 'CODEX_SDK')
+})
+
+test('OAuth auth failures use a clear sign-in prompt and avoid DSH API-key AUTH', () => {
+  const missingBearer = new Error(
+    'unexpected status 401 Unauthorized: Missing bearer or basic authentication in header',
+  )
+  const currentLoginFailure = classifySdkError(missingBearer)
+  assert.equal(currentLoginFailure.code, 'AUTH_REQUIRED')
+  assert.notEqual(currentLoginFailure.code, 'AUTH')
+  assert.match(currentLoginFailure.message, /^Codex ChatGPT is not signed in\./)
+  assert.equal(currentLoginFailure.cause, missingBearer)
+
+  const requiredLoginFailure = classifySdkError({
+    code: 'auth-required',
+    message: 'ChatGPT authentication required; sign in through the Codex panel.',
+  })
+  assert.equal(requiredLoginFailure.code, 'AUTH_REQUIRED')
+  assert.match(requiredLoginFailure.message, /^Codex ChatGPT is not signed in\./)
+
+  const wrappedLoginFailure = classifySdkError(new LlmError('Codex turn failed', 'CODEX_APP_SERVER', {
+    cause: { code: 'auth-required', message: 'ChatGPT authentication required' },
+  }))
+  assert.equal(wrappedLoginFailure.code, 'AUTH_REQUIRED')
+  assert.match(wrappedLoginFailure.message, /^Codex ChatGPT is not signed in\./)
+
+  for (const status of [401, 403]) {
+    const wrappedStatusFailure = classifySdkError(new LlmError(
+      'Codex app-server failed',
+      'CODEX_APP_SERVER',
+      { status },
+    ))
+    assert.equal(wrappedStatusFailure.code, 'AUTH_REQUIRED')
+    assert.notEqual(wrappedStatusFailure.code, 'AUTH')
+    assert.match(wrappedStatusFailure.message, /^Codex ChatGPT is not signed in\./)
+    assert.equal(wrappedStatusFailure.failure.status, status)
+  }
 })
 
 test('Codex request-body parser failures are retryable without widening PROTOCOL', async () => {
@@ -700,9 +741,9 @@ test('app-server TurnError codexErrorInfo preserves RPC codes and maps retry cla
   for (const code of ['usageLimitExceeded', 'sessionBudgetExceeded']) {
     assert.equal(classifyTurn({ code }).code, 'RATE_LIMIT')
   }
-  assert.equal(classifyTurn({ code: 'unauthorized' }).code, 'AUTH')
-  assert.equal(classifyTurn({ code: 'serverOverloaded', httpStatusCode: 401 }).code, 'AUTH')
-  assert.equal(classifyTurn({ code: 'serverOverloaded', httpStatusCode: 403 }).code, 'AUTH')
+  assert.equal(classifyTurn({ code: 'unauthorized' }).code, 'AUTH_REQUIRED')
+  assert.equal(classifyTurn({ code: 'serverOverloaded', httpStatusCode: 401 }).code, 'AUTH_REQUIRED')
+  assert.equal(classifyTurn({ code: 'serverOverloaded', httpStatusCode: 403 }).code, 'AUTH_REQUIRED')
   assert.equal(classifyTurn({ code: 'serverOverloaded', httpStatusCode: 408 }).code, 'TIMEOUT')
   assert.equal(classifyTurn({ code: 'serverOverloaded', httpStatusCode: 429 }).code, 'RATE_LIMIT')
   assert.equal(classifyTurn({ code: 'responseStreamDisconnected', httpStatusCode: 500 }).code, 'SERVER')

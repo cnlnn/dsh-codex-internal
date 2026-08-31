@@ -25,6 +25,10 @@ import {
 export const name = 'llm-codex-subscription'
 export const inject = ['llm', 'webServer']
 export const CODEX_PROVIDER = 'codex'
+/** DSH renders AUTH as an API-key failure; Codex uses ChatGPT OAuth instead. */
+const CODEX_AUTH_REQUIRED_CODE = 'AUTH_REQUIRED'
+const CODEX_AUTH_REQUIRED_MESSAGE =
+  'Codex ChatGPT is not signed in. Open Settings → Plugins → Plugin Configuration → Codex to sign in.'
 export const CODEX_SETTINGS_NAMESPACE = settingsNamespace('llm-codex-subscription')
 export {
   CODEX_ADAPTER_VERSION,
@@ -1305,6 +1309,7 @@ function codexReplayState(options, lineage, threadOptions, assistantBlocks, thre
 const NON_RECOVERABLE_RESUME_CODES = new Set([
   'ABORTED',
   'AUTH',
+  CODEX_AUTH_REQUIRED_CODE,
   'RATE_LIMIT',
   'SERVER',
   'TRANSPORT',
@@ -2185,6 +2190,13 @@ const CODEX_RUNTIME_ERROR_CODES = new Set([
   'CODEX_QUOTA',
 ])
 
+const CODEX_OAUTH_AUTH_MARKERS = [
+  'auth-required',
+  'authentication-required',
+  'missing-bearer',
+  'unauthorized',
+]
+
 /**
  * Codex 0.150.1 can surface an upstream empty/non-JSON body as a request
  * parser failure. Treat only this known provider shape as transient; a
@@ -2205,8 +2217,21 @@ function isCodexRequestBodyParseFailure(error, details) {
     || /\b(?:response|request)\s+body\s+(?:is|was)\s+empty\b/i.test(details)
 }
 
+/** Identify OAuth login failures without conflating them with DSH API-key AUTH. */
+function isCodexOAuthAuthFailure(error, details) {
+  const status = errorStatus(error)
+  if (status === 401 || status === 403) return true
+  // Preserve the established timeout, rate-limit, and server classifications
+  // when an unrelated provider message happens to mention authentication.
+  if (status !== undefined) return false
+  return hasErrorMarker(error, details, CODEX_OAUTH_AUTH_MARKERS)
+    || /\b(?:authentication|login)\b/i.test(details)
+    || /\b(?:401|403)\b/i.test(details)
+}
+
 function transientSdkCode(error, details) {
   if (isCodexRequestBodyParseFailure(error, details)) return 'SERVER'
+  if (isCodexOAuthAuthFailure(error, details)) return CODEX_AUTH_REQUIRED_CODE
   const status = errorStatus(error)
   // A provider HTTP 4xx is not a transport retry, even when a wrapper adds a
   // socket/timeout code. The known request-body parser shape above is the
@@ -2217,7 +2242,6 @@ function transientSdkCode(error, details) {
   if (status !== undefined && status >= 500) return 'SERVER'
   const codes = [...errorFields(error)].map(code => code.toUpperCase())
   if (hasErrorMarker(error, details, ['usageLimitExceeded', 'sessionBudgetExceeded'])) return 'RATE_LIMIT'
-  if (hasErrorMarker(error, details, ['unauthorized'])) return 'AUTH'
   if (hasErrorMarker(error, details, [
     'httpConnectionFailed',
     'responseStreamConnectionFailed',
@@ -2268,13 +2292,25 @@ function isCodexContextOverflow(details) {
 
 export function classifySdkError(error) {
   const details = errorDetails(error)
-  const message = details.length > 0 ? details : String(error)
   const contextOverflow = isCodexContextOverflow(details)
+  const oauthAuthFailure = isCodexOAuthAuthFailure(error, details)
+  const message = oauthAuthFailure
+    ? CODEX_AUTH_REQUIRED_MESSAGE
+    : details.length > 0 ? details : String(error)
   const transientCode = transientSdkCode(error, details)
   const explicitCodes = [...errorFields(error)].map(code => code.toUpperCase())
-  const statusCode = statusFailureCode(errorStatus(error))
+  const statusCode = oauthAuthFailure
+    ? CODEX_AUTH_REQUIRED_CODE
+    : statusFailureCode(errorStatus(error))
   if (error instanceof LlmError) {
     if (error.code === CONTEXT_WINDOW_EXCEEDED_CODE) return error
+    if (oauthAuthFailure && error.code !== 'PROTOCOL') {
+      const options = { cause: error }
+      for (const key of ['status', 'providerRetryAfterMs', 'requestId']) {
+        if (error.failure?.[key] !== undefined) options[key] = error.failure[key]
+      }
+      return new LlmError(message, CODEX_AUTH_REQUIRED_CODE, options)
+    }
     if (statusCode !== undefined
       && (error.code === 'CODEX_SDK' || error.code === 'CODEX_APP_SERVER' || error.code === 'CODEX_QUOTA')) {
       const options = { cause: error }
@@ -2303,7 +2339,7 @@ export function classifySdkError(error) {
   if (statusCode !== undefined) return new LlmError(message, statusCode, { cause: error })
   if (contextOverflow) return new LlmError(message, CONTEXT_WINDOW_EXCEEDED_CODE, { cause: error })
   if (/aborted|abort/i.test(message)) return new LlmError(message, 'ABORTED', { cause: error })
-  if (hasErrorMarker(error, details, ['unauthorized'])) return new LlmError(message, 'AUTH', { cause: error })
+  if (oauthAuthFailure) return new LlmError(message, CODEX_AUTH_REQUIRED_CODE, { cause: error })
   if (hasErrorMarker(error, details, ['usageLimitExceeded', 'sessionBudgetExceeded'])) {
     return new LlmError(message, 'RATE_LIMIT', { cause: error })
   }
