@@ -16,6 +16,7 @@ import {
 	codexAppServerEnvironment,
 	ensureCodexRuntime,
 	expandHomePath,
+	parseWindowsAclSddl,
 	resolveCodexRuntimePaths,
 	validateWindowsAclSnapshot,
 } from '../lib/app-server.js'
@@ -145,58 +146,96 @@ test('expands POSIX and Windows home shorthands before resolving the plugin home
 	assert.equal(resolveCodexRuntimePaths({ env: { DSH_HOME: '~\\dsh' }, homeDir: home }).dshHome, join(home, 'dsh'))
 })
 
-test('Windows private ACL helper replaces explicit rules and fails closed on an extra ACE', () => {
-	const calls = []
-	const sid = 'S-1-5-21-111-222-333-1001'
-	const path = 'C:\\dsh\\codex-adapter'
-	const ownerRule = {
-		Sid: sid,
-		Type: 'Allow',
-		Rights: 0x1f01ff,
-		Inheritance: 3,
-		Propagation: 0,
-		Inherited: false,
+test('Windows private ACL helper uses icacls and validates machine-readable owner-only DACLs', () => {
+	const root = mkdtempSync(join(tmpdir(), 'dsh-codex-acl-test-'))
+	try {
+		const path = join(root, 'codex-adapter')
+		mkdirSync(path)
+		const calls = []
+		const sid = 'S-1-5-21-111-222-333-1001'
+		const ownerRule = {
+			Sid: sid,
+			Type: 'Allow',
+			Rights: 0x1f01ff,
+			Inheritance: 3,
+			Propagation: 0,
+			Inherited: false,
+		}
+		let restoreContents
+		const runCommand = (command, args) => {
+			calls.push({ command, args })
+			if (command === 'whoami.exe') return `USER\n${sid}\n`
+			if (args.includes('/restore')) {
+				restoreContents = readFileSync(args[args.indexOf('/restore') + 1], 'utf16le')
+			}
+			if (args.includes('/save')) {
+				const aclFile = args[args.indexOf('/save') + 1]
+				writeFileSync(aclFile, `${path}\r\nD:PAI(A;OICI;FA;;;${sid})S:AI\r\n`, { encoding: 'utf16le' })
+			}
+			return ''
+		}
+		applyWindowsPrivateDirectoryAcl(path, { platform: 'win32', runCommand })
+		assert.deepEqual(calls.map(call => call.command), ['whoami.exe', 'icacls.exe', 'icacls.exe'])
+		assert.deepEqual(calls[0], { command: 'whoami.exe', args: ['/user'] })
+		assert.deepEqual(calls[1].args.slice(0, 2), [root, '/restore'])
+		assert.equal(calls[1].args.at(-1), '/q')
+		assert.equal(restoreContents, `\ufeffcodex-adapter\r\nD:PAI(A;OICI;FA;;;${sid})\r\n`)
+		assert.equal(calls[2].args[0], path)
+		assert.deepEqual(calls[2].args.slice(1, 2), ['/save'])
+		assert.equal(calls[2].args.at(-1), '/q')
+		assert.deepEqual(readdirSync(root).filter(name => name.endsWith('.acl')), [])
+		assert.deepEqual(parseWindowsAclSddl(`D:\\tmp\\codex-adapter\r\nD:PAI(A;OICI;FA;;;${sid})S:AI`), {
+			Protected: true,
+			Rules: [ownerRule],
+		})
+		assert.doesNotThrow(() => validateWindowsAclSnapshot({ Protected: true, Rules: [ownerRule] }, sid))
+		assert.throws(() => validateWindowsAclSnapshot({
+			Protected: true,
+			Rules: [ownerRule, { ...ownerRule, Sid: 'S-1-1-0' }],
+		}, sid), /owner-only DACL/)
+		assert.throws(() => applyWindowsPrivateDirectoryAcl(path, {
+			platform: 'win32',
+			userSid: sid,
+			runCommand: () => '',
+			readSnapshot: () => ({ Protected: true, Rules: [ownerRule, { ...ownerRule, Sid: 'S-1-1-0' }] }),
+		}), /owner-only DACL/)
+		assert.throws(() => applyWindowsPrivateDirectoryAcl(path, {
+			platform: 'win32',
+			userSid: sid,
+			runCommand() {
+				throw new Error('access denied')
+			},
+		}), /access denied/)
+
+		const cache = new Map()
+		const cachedCalls = []
+		const cachedRunCommand = (command, args) => {
+			cachedCalls.push({ command, args })
+			return command === 'whoami.exe' ? `USER\n${sid}\n` : ''
+		}
+		applyWindowsPrivateDirectoryAcl(path, {
+			platform: 'win32',
+			cache,
+			runCommand: cachedRunCommand,
+			readSnapshot: () => ({ Protected: true, Rules: [ownerRule] }),
+		})
+		applyWindowsPrivateDirectoryAcl(path, {
+			platform: 'win32',
+			cache,
+			runCommand: cachedRunCommand,
+			readSnapshot: () => ({ Protected: true, Rules: [ownerRule] }),
+		})
+		assert.equal(cachedCalls.length, 2)
+
+		const ignored = []
+		applyWindowsPrivateDirectoryAcl(join(root, 'ignored'), {
+			platform: 'linux',
+			runCommand: (...args) => ignored.push(args),
+		})
+		assert.deepEqual(ignored, [])
+	} finally {
+		rmSync(root, { recursive: true, force: true })
 	}
-	const runCommand = (command, args) => {
-		calls.push({ command, args })
-		if (command === 'whoami') return 'USER\nS-1-5-21-111-222-333-1001\n'
-		return `DCA_ACL_RESULT:${JSON.stringify({ Protected: true, Rules: [ownerRule] })}`
-	}
-	applyWindowsPrivateDirectoryAcl(path, { platform: 'win32', runCommand })
-	assert.equal(calls.length, 2)
-	assert.deepEqual(calls[0], { command: 'whoami', args: ['/user'] })
-	assert.equal(calls[1].command, 'powershell.exe')
-	assert.deepEqual(calls[1].args.slice(0, 3), ['-NoLogo', '-NoProfile', '-NonInteractive'])
-	assert.equal(calls[1].args[3], '-EncodedCommand')
-	const script = Buffer.from(calls[1].args[4], 'base64').toString('utf16le')
-	assert.match(script, /SetAccessRuleProtection\(\$true, \$false\)/)
-	assert.match(script, /RemoveAccessRuleSpecific/)
-	assert.match(script, /\$rules\.Count -ne 1/)
-	assert.doesNotThrow(() => validateWindowsAclSnapshot({ Protected: true, Rules: [ownerRule] }, sid))
-	assert.throws(() => validateWindowsAclSnapshot({
-		Protected: true,
-		Rules: [ownerRule, { ...ownerRule, Sid: 'S-1-1-0' }],
-	}, sid), /owner-only DACL/)
-	assert.throws(() => applyWindowsPrivateDirectoryAcl(path, {
-		platform: 'win32',
-		userSid: sid,
-		runCommand() {
-			return `DCA_ACL_RESULT:${JSON.stringify({ Protected: true, Rules: [ownerRule, { ...ownerRule, Sid: 'S-1-1-0' }] })}`
-		},
-	}), /owner-only DACL/)
-	assert.throws(() => applyWindowsPrivateDirectoryAcl(path, {
-		platform: 'win32',
-		userSid: sid,
-		runCommand() {
-			throw new Error('access denied')
-		},
-	}), /access denied/)
-	const ignored = []
-	applyWindowsPrivateDirectoryAcl(join(tmpdir(), 'ignored'), {
-		platform: 'linux',
-		runCommand: (...args) => ignored.push(args),
-	})
-	assert.deepEqual(ignored, [])
 })
 
 test('writes a private minimal Codex config atomically and preserves the old file on replacement', () => {

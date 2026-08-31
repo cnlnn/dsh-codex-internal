@@ -67,15 +67,15 @@ independent account.
 
 ### GitHub Release (recommended)
 
-The release asset is a platform-neutral npm tarball; it is not published to npm. `pnpm`, through `dsh plugin`, resolves the pinned runtime dependencies and the matching official Codex native optional package for the host OS and architecture. The `v0.8.1` asset is:
+The release asset is a platform-neutral npm tarball; it is not published to npm. `pnpm`, through `dsh plugin`, resolves the pinned runtime dependencies and the matching official Codex native optional package for the host OS and architecture. The `v0.8.2` asset is:
 
-`local-dsh-codex-adapter-0.8.1.tgz`
+`local-dsh-codex-adapter-0.8.2.tgz`
 
 macOS/Linux:
 
 ```sh
 dsh plugin --profile web add --save-exact \
-  "https://github.com/cnlnn/dsh-codex-adapter/releases/download/v0.8.1/local-dsh-codex-adapter-0.8.1.tgz"
+  "https://github.com/cnlnn/dsh-codex-adapter/releases/download/v0.8.2/local-dsh-codex-adapter-0.8.2.tgz"
 dsh --profile web --dump-config
 # Restart the DSH Web profile after the bundle changes.
 dsh web --no-open
@@ -85,7 +85,7 @@ Windows PowerShell:
 
 ```powershell
 dsh plugin --profile web add --save-exact `
-  "https://github.com/cnlnn/dsh-codex-adapter/releases/download/v0.8.1/local-dsh-codex-adapter-0.8.1.tgz"
+  "https://github.com/cnlnn/dsh-codex-adapter/releases/download/v0.8.2/local-dsh-codex-adapter-0.8.2.tgz"
 dsh --profile web --dump-config
 dsh web --no-open
 ```
@@ -93,8 +93,8 @@ dsh web --no-open
 For an audited install, download `SHA256SUMS` from the same release and verify the tarball before installing it from a local `file:` URL:
 
 ```sh
-curl -fLO https://github.com/cnlnn/dsh-codex-adapter/releases/download/v0.8.1/local-dsh-codex-adapter-0.8.1.tgz
-curl -fLO https://github.com/cnlnn/dsh-codex-adapter/releases/download/v0.8.1/SHA256SUMS
+curl -fLO https://github.com/cnlnn/dsh-codex-adapter/releases/download/v0.8.2/local-dsh-codex-adapter-0.8.2.tgz
+curl -fLO https://github.com/cnlnn/dsh-codex-adapter/releases/download/v0.8.2/SHA256SUMS
 ```
 
 Linux checksum verification:
@@ -113,7 +113,7 @@ After verification, install the local tarball:
 
 ```sh
 dsh plugin --profile web add --save-exact \
-  "file:$PWD/local-dsh-codex-adapter-0.8.1.tgz"
+  "file:$PWD/local-dsh-codex-adapter-0.8.2.tgz"
 ```
 
 The release workflow uploads exactly two assets: the package tarball and `SHA256SUMS`. To update, run `dsh plugin --profile web add --save-exact` with the new release URL, then restart the profile. No `settings.yaml` edit is required; configuration remains in `Settings → Plugins → Plugin Configuration → Codex`.
