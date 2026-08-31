@@ -194,7 +194,7 @@ test('Windows private ACL helper uses icacls and validates machine-readable owne
 			Rules: [ownerRule, { ...ownerRule, Sid: 'S-1-1-0' }],
 		}, sid), error => {
 			assert.match(error.message, /owner-only DACL/)
-			assert.match(error.message, /Protected=true Rules=2 Type=Allow Rights=2032127 Inheritance=3 Propagation=0 Inherited=false SidMatches=true/)
+			assert.match(error.message, /Protected=true Rules=2 Type=Allow Rights=2032127 Inheritance=3 Propagation=0 Inherited=false SidMatches=true SidKind=numeric SidLength=25 TrimMatches=true CaseFoldMatches=true/)
 			assert.doesNotMatch(error.message, /S-1-1-0|codex-adapter|tmp/)
 			return true
 		})
@@ -203,7 +203,16 @@ test('Windows private ACL helper uses icacls and validates machine-readable owne
 			Rules: [{ ...ownerRule, Sid: 'S-1-5-21-111-222-333-1002' }],
 		}, sid), error => {
 			assert.match(error.message, /owner rule is incomplete/)
-			assert.match(error.message, /Protected=true Rules=1 Type=Allow Rights=2032127 Inheritance=3 Propagation=0 Inherited=false SidMatches=false/)
+			assert.match(error.message, /Protected=true Rules=1 Type=Allow Rights=2032127 Inheritance=3 Propagation=0 Inherited=false SidMatches=false SidKind=numeric SidLength=25 TrimMatches=false CaseFoldMatches=false/)
+			assert.doesNotMatch(error.message, /S-1-5-21|codex-adapter|tmp/)
+			return true
+		})
+		assert.throws(() => validateWindowsAclSnapshot({
+			Protected: true,
+			Rules: [{ ...ownerRule, Sid: ' CO ' }],
+		}, sid), error => {
+			assert.match(error.message, /owner rule is incomplete/)
+			assert.match(error.message, /SidMatches=false SidKind=alias SidLength=4 TrimMatches=false CaseFoldMatches=false/)
 			assert.doesNotMatch(error.message, /S-1-5-21|codex-adapter|tmp/)
 			return true
 		})
