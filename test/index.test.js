@@ -5,7 +5,7 @@ import { PassThrough } from 'node:stream'
 import test from 'node:test'
 import { Codex } from '@openai/codex-sdk'
 import { Context } from '@deepseek-ai/cordis'
-import { LlmRuntime } from '@deepseek-ai/dsh-llm'
+import { LlmError, LlmRuntime } from '@deepseek-ai/dsh-llm'
 import {
   buildCodexPrompt,
   buildCompactionPrompt,
@@ -43,6 +43,17 @@ async function collectStream(adapter, options) {
   const chunks = []
   for await (const chunk of adapter.stream(options)) chunks.push(chunk)
   return chunks
+}
+
+async function collectStreamFailure(adapter, options) {
+  const chunks = []
+  let error
+  try {
+    for await (const chunk of adapter.stream(options)) chunks.push(chunk)
+  } catch (caught) {
+    error = caught
+  }
+  return { chunks, error }
 }
 
 async function collectIterable(iterable) {
@@ -257,11 +268,18 @@ test('context overflow classification is conservative and keeps the original cau
   assert.equal(classified.code, 'CONTEXT_WINDOW_EXCEEDED')
   assert.equal(classified.cause, sdkError)
   assert.match(classified.message, /1048576/)
+  const clientContextError = Object.assign(
+    new Error('Input exceeds the maximum length of 1048576 characters'),
+    { status: 400 },
+  )
+  assert.equal(classifySdkError(clientContextError).code, 'CONTEXT_WINDOW_EXCEEDED')
 
   const appServerError = classifySdkError({ error: { code: 'ContextWindowExceeded', message: 'request rejected' } })
   assert.equal(appServerError.code, 'CONTEXT_WINDOW_EXCEEDED')
   const codeBearingError = new Error('request rejected')
   codeBearingError.code = 'ContextWindowExceeded'
+  assert.equal(classifySdkError(codeBearingError).code, 'CONTEXT_WINDOW_EXCEEDED')
+  codeBearingError.status = 400
   assert.equal(classifySdkError(codeBearingError).code, 'CONTEXT_WINDOW_EXCEEDED')
   const nestedCodeError = new Error('request rejected')
   nestedCodeError.data = { detail: { type: 'ContextWindowExceeded' } }
@@ -269,6 +287,59 @@ test('context overflow classification is conservative and keeps the original cau
   assert.equal(classifySdkError({ status: 400, data: { code: 'invalid_request' }, message: 'invalid request' }).code,
     'CODEX_SDK')
   assert.equal(classifySdkError({ status: 400, message: 'invalid request' }).code, 'CODEX_SDK')
+  assert.equal(classifySdkError({ status: 400, message: 'Bad Gateway' }).code, 'CODEX_SDK')
+  assert.equal(classifySdkError({ status: 400, message: 'server error' }).code, 'CODEX_SDK')
+  assert.equal(classifySdkError({ status: 400, message: 'request timed out' }).code, 'CODEX_SDK')
+  assert.equal(classifySdkError({ status: 400, message: 'socket closed' }).code, 'CODEX_SDK')
+  assert.equal(classifySdkError({ status: 401, message: 'server error' }).code, 'AUTH')
+  assert.equal(classifySdkError({ status: 403, message: 'connection closed' }).code, 'AUTH')
+  assert.equal(classifySdkError({ status: 404, message: 'service unavailable' }).code, 'CODEX_SDK')
+  assert.equal(classifySdkError({ status: 422, message: 'request timed out' }).code, 'CODEX_SDK')
+  assert.equal(classifySdkError({ status: 429, message: 'rate limit reached' }).code, 'RATE_LIMIT')
+  assert.equal(classifySdkError({ status: 429 }).code, 'RATE_LIMIT')
+  assert.equal(classifySdkError({ status: 408, message: 'request timed out' }).code, 'TIMEOUT')
+  assert.equal(classifySdkError({ status: 409, message: 'server error' }).code, 'CODEX_SDK')
+  assert.equal(classifySdkError(new LlmError('request timed out', 'CODEX_SDK', { status: 400 })).code,
+    'CODEX_SDK')
+  assert.equal(classifySdkError(new LlmError('provider response', 'CODEX_SDK', { status: 429 })).code,
+    'RATE_LIMIT')
+  assert.equal(classifySdkError(Object.assign(new Error('socket closed'), { code: 'ECONNRESET' })).code,
+    'TRANSPORT')
+  const wrappedTransport = new LlmError('Codex SDK failed', 'CODEX_SDK', {
+    cause: Object.assign(new Error('socket closed'), { code: 'ECONNRESET' }),
+  })
+  assert.equal(classifySdkError(wrappedTransport).code, 'TRANSPORT')
+  assert.equal(classifySdkError(Object.assign(new Error('request timed out'), { code: 'ETIMEDOUT' })).code,
+    'TIMEOUT')
+  assert.equal(classifySdkError(Object.assign(new Error('connect timeout'), { code: 'UND_ERR_CONNECT_TIMEOUT' })).code,
+    'TIMEOUT')
+  for (const status of [500, 502, 503, 504]) {
+    assert.equal(classifySdkError({ status, message: `HTTP ${status}` }).code, 'SERVER')
+    assert.equal(classifySdkError({ statusCode: status, message: `HTTP ${status}` }).code, 'SERVER')
+    assert.equal(classifySdkError(new Error(`HTTP status code ${status}`)).code, 'SERVER')
+  }
+  for (const message of [
+    'Bad Gateway',
+    'Bad_Gateway',
+    'service unavailable',
+    'service-unavailable',
+    'internal server error',
+    'server_error',
+  ]) {
+    assert.equal(classifySdkError(new Error(message)).code, 'SERVER')
+  }
+  for (const message of [
+    'connection reset by peer',
+    'connection_closed by peer',
+    'socket closed',
+  ]) {
+    assert.equal(classifySdkError(new Error(message)).code, 'TRANSPORT')
+  }
+  assert.equal(classifySdkError(new Error('CLI premature exit')).code, 'SERVER')
+  assert.equal(classifySdkError(new Error('Codex CLI process exited prematurely')).code, 'SERVER')
+  assert.equal(classifySdkError(new Error('authentication request reset')).code, 'AUTH')
+  assert.equal(classifySdkError({ code: 'PROTOCOL', message: 'malformed response' }).code, 'PROTOCOL')
+  assert.equal(classifySdkError(new Error('invalid JSON response')).code, 'CODEX_SDK')
 })
 
 test('adapter prepareCall exposes the conservative DSH context contract', async () => {
@@ -1054,6 +1125,609 @@ test('adapter converts structured Codex requests into DSH tool calls', async () 
     && chunk.block.type === 'tool-call'
     && chunk.block.arguments === '{"path":"README.md"}'))
   assert.deepEqual(chunks.at(-1), { type: 'finish', reason: { kind: 'tool-calls' } })
+})
+
+test('adapter fails closed for missing or duplicate tool-call identity', async () => {
+  const cases = [
+    {
+      name: 'missing-id',
+      toolCalls: [{ id: '', name: 'read', arguments_json: '{}' }],
+      diagnostic: /id=.*missing.*empty/i,
+    },
+    {
+      name: 'missing-name',
+      toolCalls: [{ id: 'call-no-name', name: ' ', arguments_json: '{}' }],
+      diagnostic: /name=.*missing/i,
+    },
+    {
+      name: 'duplicate-id',
+      toolCalls: [
+        { id: 'call-duplicate', name: 'read', arguments_json: '{}' },
+        { id: 'call-duplicate', name: 'write', arguments_json: '{}' },
+      ],
+      diagnostic: /must be unique/i,
+    },
+  ]
+
+  for (const scenario of cases) {
+    const prompts = []
+    const adapter = new CodexSubscriptionAdapter({}, () => ({
+      startThread() {
+        return {
+          id: `thread-strict-${scenario.name}`,
+          async runStreamed(prompt) {
+            prompts.push(prompt)
+            return {
+              events: streamedEvents([JSON.stringify({ reasoning: '', text: '', tool_calls: scenario.toolCalls })]),
+            }
+          },
+        }
+      },
+    }))
+    const failure = await collectStreamFailure(adapter, {
+      provider: CODEX_PROVIDER,
+      model: 'gpt-5.6-sol',
+      sessionId: `session-strict-${scenario.name}`,
+      messages: [textMessage(`user-${scenario.name}`, 'perform the operation')],
+    })
+    assert.equal(failure.error.code, 'PROTOCOL')
+    assert.match(failure.error.message, scenario.diagnostic)
+    assert.equal(prompts.length, 1, `${scenario.name} must not launch an unsafe repair`)
+    assert.equal(failure.chunks.some(chunk => chunk.type === 'tool-call-delta'), false)
+    assert.equal(adapter.threadPool.size(), 0)
+  }
+})
+
+test('adapter repairs one invalid tool call without duplicating visible blocks or usage', async () => {
+  const prompts = []
+  const adapter = new CodexSubscriptionAdapter({}, () => ({
+    startThread() {
+      return {
+        id: 'thread-tool-repair',
+        async runStreamed(prompt) {
+          prompts.push(prompt)
+          const response = prompts.length === 1
+            ? {
+                reasoning: 'initial reasoning',
+                text: 'initial answer',
+                tool_calls: [{
+                  id: 'call-bad',
+                  name: 'read',
+                  arguments_json: '{"path":"secret.txt"',
+                }],
+              }
+            : {
+                reasoning: '',
+                text: '',
+                tool_calls: [{ id: 'call-bad', name: 'read', arguments_json: '{"path":"README.md"}' }],
+              }
+          return {
+            events: streamedEvents([JSON.stringify(response)], {
+              input_tokens: prompts.length === 1 ? 10 : 5,
+              cached_input_tokens: prompts.length === 1 ? 2 : 1,
+              cache_write_input_tokens: prompts.length === 1 ? 1 : 0,
+              output_tokens: prompts.length === 1 ? 3 : 2,
+              reasoning_output_tokens: 1,
+            }),
+          }
+        },
+      }
+    },
+  }))
+
+  const chunks = await collectStream(adapter, {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-5.6-sol',
+    sessionId: 'session-tool-repair',
+    messages: [textMessage('user-1', 'read the file')],
+  })
+
+  assert.equal(prompts.length, 2)
+  assert.match(prompts[1], /call-bad/)
+  assert.match(prompts[1], /name="read"/)
+  assert.match(prompts[1], /invalid JSON syntax/)
+  assert.doesNotMatch(prompts[1], /secret\.txt/)
+  assert.deepEqual(chunks.filter(chunk => chunk.type === 'reasoning-delta').map(chunk => chunk.text), [
+    'initial reasoning',
+  ])
+  assert.deepEqual(chunks.filter(chunk => chunk.type === 'text-delta').map(chunk => chunk.text), [
+    'initial answer',
+  ])
+  assert.equal(chunks.filter(chunk => chunk.type === 'usage').length, 1)
+  assert.deepEqual(chunks.find(chunk => chunk.type === 'usage').usage, {
+    inputTokens: 11,
+    outputTokens: 5,
+    totalTokens: 20,
+    cacheReadTokens: 3,
+    cacheWriteTokens: 1,
+    reasoningTokens: 2,
+  })
+  assert.deepEqual(chunks.filter(chunk => chunk.type === 'block-end').map(chunk => chunk.block.type), [
+    'reasoning', 'text', 'tool-call',
+  ])
+  assert.equal(chunks.at(-1).reason.kind, 'tool-calls')
+})
+
+test('adapter repairs the two redacted malformed tool-call tail fixtures', async () => {
+  for (const [fixtureIndex, fixtureName] of [
+    [1, 'codex-tool-call-tail-redacted-1.txt'],
+    [2, 'codex-tool-call-tail-redacted-2.txt'],
+  ]) {
+    const fixture = await readFile(new URL(`./fixtures/${fixtureName}`, import.meta.url), 'utf8')
+    const initial = JSON.parse(fixture)
+    assert.equal(initial.tool_calls[0].arguments_json.endsWith(',{'), true)
+    const prompts = []
+    const adapter = new CodexSubscriptionAdapter({}, () => ({
+      startThread() {
+        return {
+          id: `thread-tail-fixture-${fixtureIndex}`,
+          async runStreamed(prompt) {
+            prompts.push(prompt)
+            const response = prompts.length === 1
+              ? initial
+              : {
+                  reasoning: '',
+                  text: '',
+                  tool_calls: [{
+                    id: initial.tool_calls[0].id,
+                    name: initial.tool_calls[0].name,
+                    arguments_json: '{}',
+                  }],
+                }
+            return { events: streamedEvents([JSON.stringify(response)]) }
+          },
+        }
+      },
+    }))
+    const chunks = await collectStream(adapter, {
+      provider: CODEX_PROVIDER,
+      model: 'gpt-5.6-sol',
+      sessionId: `session-tail-fixture-${fixtureIndex}`,
+      messages: [textMessage(`user-tail-fixture-${fixtureIndex}`, 'inspect the result')],
+    })
+    assert.equal(prompts.length, 2)
+    assert.doesNotMatch(prompts[1], /REDACTED/)
+    assert.equal(chunks.filter(chunk => chunk.type === 'tool-call-delta').length, 1)
+    assert.deepEqual(chunks.find(chunk => chunk.type === 'block-end' && chunk.block.type === 'tool-call').block, {
+      type: 'tool-call',
+      id: initial.tool_calls[0].id,
+      name: initial.tool_calls[0].name,
+      arguments: '{}',
+    })
+  }
+})
+
+test('adapter repairs only invalid tool calls and preserves call order', async () => {
+  const prompts = []
+  const adapter = new CodexSubscriptionAdapter({}, () => ({
+    startThread() {
+      return {
+        id: 'thread-multi-tool-repair',
+        async runStreamed(prompt) {
+          prompts.push(prompt)
+          const response = prompts.length === 1
+            ? {
+                reasoning: '',
+                text: '',
+                tool_calls: [
+                  { id: 'call-1', name: 'read', arguments_json: '{"path":"a"}' },
+                  { id: 'call-2', name: 'write', arguments_json: '{"path":"b"' },
+                  { id: 'call-3', name: 'read', arguments_json: '{"path":"c"}' },
+                ],
+              }
+            : {
+                reasoning: '',
+                text: '',
+                tool_calls: [{ id: 'call-2', name: 'write', arguments_json: '{"path":"b","data":"x"}' }],
+              }
+          return { events: streamedEvents([JSON.stringify(response)]) }
+        },
+      }
+    },
+  }))
+
+  const chunks = await collectStream(adapter, {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-5.6-sol',
+    sessionId: 'session-multi-tool-repair',
+    messages: [textMessage('user-1', 'do three operations')],
+  })
+  const calls = chunks.filter(chunk => chunk.type === 'block-end' && chunk.block.type === 'tool-call')
+  assert.deepEqual(calls.map(chunk => chunk.block.id), ['call-1', 'call-2', 'call-3'])
+  assert.deepEqual(calls.map(chunk => chunk.block.arguments), [
+    '{"path":"a"}',
+    '{"path":"b","data":"x"}',
+    '{"path":"c"}',
+  ])
+  assert.doesNotMatch(prompts[1], /call-1|call-3/)
+  assert.equal(prompts.length, 2)
+})
+
+test('adapter rejects tool-call repair id or name drift and invalidates the pooled thread', async () => {
+  let starts = 0
+  const adapter = new CodexSubscriptionAdapter({}, () => ({
+    startThread() {
+      starts += 1
+      const first = starts === 1
+      return {
+        id: `thread-tool-drift-${starts}`,
+        async runStreamed(prompt) {
+          if (!first) return {
+            events: streamedEvents([JSON.stringify({ reasoning: '', text: 'retry', tool_calls: [] })]),
+          }
+          const response = prompt.startsWith('Repair ')
+            ? { reasoning: '', text: '', tool_calls: [{ id: 'call-other', name: 'read', arguments_json: '{}' }] }
+            : { reasoning: '', text: '', tool_calls: [{ id: 'call-original', name: 'read', arguments_json: '{' }] }
+          return { events: streamedEvents([JSON.stringify(response)]) }
+        },
+      }
+    },
+  }))
+  const options = {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-5.6-sol',
+    sessionId: 'session-tool-drift',
+    messages: [textMessage('user-1', 'read')],
+  }
+  const failure = await collectStreamFailure(adapter, options)
+  assert.equal(failure.error.code, 'PROTOCOL')
+  assert.match(failure.error.message, /call-original/)
+  assert.match(failure.error.message, /read/)
+  assert.doesNotMatch(failure.error.message, /arguments/)
+  await collectStream(adapter, options)
+  assert.equal(starts, 2)
+})
+
+test('adapter rejects a second invalid repair response and invalidates the thread', async () => {
+  let starts = 0
+  const adapter = new CodexSubscriptionAdapter({}, () => ({
+    startThread() {
+      starts += 1
+      const first = starts === 1
+      return {
+        id: `thread-tool-invalid-repair-${starts}`,
+        async runStreamed(prompt) {
+          if (!first) return {
+            events: streamedEvents([JSON.stringify({ reasoning: '', text: 'retry', tool_calls: [] })]),
+          }
+          const response = prompt.startsWith('Repair ')
+            ? { reasoning: '', text: '', tool_calls: [{ id: 'call-original', name: 'read', arguments_json: '[]' }] }
+            : { reasoning: '', text: '', tool_calls: [{ id: 'call-original', name: 'read', arguments_json: '{' }] }
+          return { events: streamedEvents([JSON.stringify(response)], {
+            input_tokens: prompt.startsWith('Repair ') ? 2 : 3,
+            output_tokens: 1,
+          }) }
+        },
+      }
+    },
+  }))
+  const options = {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-5.6-sol',
+    sessionId: 'session-tool-invalid-repair',
+    messages: [textMessage('user-1', 'read')],
+  }
+  const failure = await collectStreamFailure(adapter, options)
+  assert.equal(failure.error.code, 'PROTOCOL')
+  assert.match(failure.error.message, /call-original/)
+  assert.equal(failure.chunks.some(chunk => chunk.type === 'tool-call-delta'), false)
+  assert.equal(failure.chunks.filter(chunk => chunk.type === 'usage').length, 1)
+  assert.deepEqual(failure.chunks.find(chunk => chunk.type === 'usage').usage, {
+    inputTokens: 5,
+    outputTokens: 2,
+    totalTokens: 7,
+  })
+  await collectStream(adapter, options)
+  assert.equal(starts, 2)
+})
+
+test('adapter classifies a failed repair turn as retryable server failure', async () => {
+  let starts = 0
+  const adapter = new CodexSubscriptionAdapter({}, () => ({
+    startThread() {
+      starts += 1
+      const first = starts === 1
+      return {
+        id: `thread-tool-failed-${starts}`,
+        async runStreamed(prompt) {
+          if (!first) return {
+            events: streamedEvents([JSON.stringify({ reasoning: '', text: 'retry', tool_calls: [] })]),
+          }
+          if (prompt.startsWith('Repair ')) {
+            return {
+              events: (async function * () {
+                yield { type: 'turn.failed', error: { message: 'repair turn failed' } }
+              })(),
+            }
+          }
+          return { events: streamedEvents([JSON.stringify({
+            reasoning: '',
+            text: '',
+            tool_calls: [{ id: 'call-original', name: 'read', arguments_json: '{' }],
+          })]) }
+        },
+      }
+    },
+  }))
+  const options = {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-5.6-sol',
+    sessionId: 'session-tool-failed',
+    messages: [textMessage('user-1', 'read')],
+  }
+  const failure = await collectStreamFailure(adapter, options)
+  assert.equal(failure.error.code, 'SERVER')
+  assert.equal(failure.chunks.some(chunk => chunk.type === 'tool-call-delta'), false)
+  await collectStream(adapter, options)
+  assert.equal(starts, 2)
+})
+
+test('adapter invalidates a thread when tool-call repair fails or is aborted', async () => {
+  let starts = 0
+  let repairStarted
+  const repairReady = new Promise(resolve => { repairStarted = resolve })
+  const adapter = new CodexSubscriptionAdapter({}, () => ({
+    startThread() {
+      starts += 1
+      const first = starts === 1
+      return {
+        id: `thread-tool-abort-${starts}`,
+        async runStreamed(prompt, { signal } = {}) {
+          if (!first) return {
+            events: streamedEvents([JSON.stringify({ reasoning: '', text: 'retry', tool_calls: [] })]),
+          }
+          if (prompt.startsWith('Repair ')) {
+            repairStarted()
+            return {
+              events: (async function * () {
+                yield { type: 'item.updated', item: {
+                  type: 'agent_message',
+                  text: JSON.stringify({ reasoning: '', text: '', tool_calls: [] }),
+                } }
+                while (!signal?.aborted) await new Promise(resolve => setTimeout(resolve, 1))
+                yield { type: 'turn.completed', usage: { input_tokens: 2 } }
+              })(),
+            }
+          }
+          return { events: streamedEvents([JSON.stringify({
+            reasoning: '',
+            text: '',
+            tool_calls: [{ id: 'call-original', name: 'read', arguments_json: '{' }],
+          })]) }
+        },
+      }
+    },
+  }))
+  const controller = new AbortController()
+  const options = {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-5.6-sol',
+    sessionId: 'session-tool-abort',
+    signal: controller.signal,
+    messages: [textMessage('user-1', 'read')],
+  }
+  const pending = collectStreamFailure(adapter, options)
+  await repairReady
+  controller.abort()
+  const failure = await pending
+  assert.equal(failure.error.code, 'ABORTED')
+  assert.equal(failure.chunks.some(chunk => chunk.type === 'tool-call-delta'), false)
+  assert.equal(failure.chunks.filter(chunk => chunk.type === 'usage').length, 1)
+  await collectStream(adapter, { ...options, signal: new AbortController().signal })
+  assert.equal(starts, 2)
+})
+
+test('transient repair failure is retryable without replaying tools, then the loop can continue', async () => {
+  let starts = 0
+  const adapter = new CodexSubscriptionAdapter({}, () => ({
+    startThread() {
+      starts += 1
+      return {
+        id: `thread-tool-retry-${starts}`,
+        async runStreamed(prompt) {
+          if (starts === 1) {
+            if (prompt.startsWith('Repair ')) {
+              const error = new Error('socket reset')
+              error.code = 'ECONNRESET'
+              throw error
+            }
+            return { events: streamedEvents([JSON.stringify({
+              reasoning: '',
+              text: '',
+              tool_calls: [{ id: 'call-once', name: 'read', arguments_json: '{' }],
+            })]) }
+          }
+          const continuation = prompt.includes('tool-result')
+          return { events: streamedEvents([JSON.stringify(continuation
+            ? { reasoning: '', text: 'done', tool_calls: [] }
+            : {
+                reasoning: '',
+                text: '',
+                tool_calls: [{ id: 'call-once', name: 'read', arguments_json: '{"path":"a"}' }],
+              })]) }
+        },
+      }
+    },
+  }))
+  const options = {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-5.6-sol',
+    sessionId: 'session-tool-retry',
+    messages: [textMessage('user-1', 'read a')],
+  }
+  const first = await collectStreamFailure(adapter, options)
+  assert.equal(first.error.code, 'TRANSPORT')
+  assert.equal(first.chunks.some(chunk => chunk.type === 'tool-call-delta'), false)
+
+  const toolChunks = await collectStream(adapter, options)
+  assert.equal(toolChunks.filter(chunk => chunk.type === 'tool-call-delta').length, 1)
+  const continuation = {
+    ...options,
+    messages: [
+      ...options.messages,
+      {
+        id: 'assistant-1',
+        role: 'assistant',
+        content: [{ type: 'tool-call', id: 'call-once', name: 'read', arguments: '{"path":"a"}' }],
+      },
+      {
+        id: 'tool-1',
+        role: 'user',
+        source: { kind: 'tool', callId: 'call-once' },
+        content: [{ type: 'tool-result', toolCallId: 'call-once', content: [{ type: 'text', text: 'file' }] }],
+      },
+    ],
+  }
+  const finished = await collectStream(adapter, continuation)
+  assert.equal(finished.at(-1).reason.kind, 'stop')
+  assert.equal(starts, 2)
+  const runtime = new LlmRuntime(new Context())
+  runtime.registerAdapter([CODEX_PROVIDER], adapter)
+  assert.ok(runtime.providerRetryPolicy(CODEX_PROVIDER).retryableCodes.includes('TRANSPORT'))
+
+  const failingAdapter = new CodexSubscriptionAdapter({}, () => ({
+    startThread() {
+      return {
+        id: 'thread-runtime-error',
+        async runStreamed(prompt) {
+          if (prompt.startsWith('Repair ')) {
+            const error = new Error('socket reset')
+            error.code = 'ECONNRESET'
+            throw error
+          }
+          return { events: streamedEvents([JSON.stringify({
+            reasoning: '',
+            text: '',
+            tool_calls: [{ id: 'call-runtime', name: 'read', arguments_json: '{' }],
+          })]) }
+        },
+      }
+    },
+  }), async () => [])
+  const runtimeWithFailure = new LlmRuntime(new Context())
+  runtimeWithFailure.registerAdapter([CODEX_PROVIDER], failingAdapter)
+  const runtimeChunks = await collectIterable(runtimeWithFailure.stream({
+    provider: CODEX_PROVIDER,
+    model: 'gpt-5.6-sol',
+    sessionId: 'session-runtime-error',
+    messages: [textMessage('user-1', 'read')],
+  }))
+  assert.equal(runtimeChunks.at(-1).reason.kind, 'error')
+  assert.equal(runtimeChunks.at(-1).reason.failure.code, 'TRANSPORT')
+})
+
+test('bounded transient repair retries end with an explicit error and an idle pool', async () => {
+  let starts = 0
+  const adapter = new CodexSubscriptionAdapter({}, () => ({
+    startThread() {
+      starts += 1
+      return {
+        id: `thread-tool-retry-limit-${starts}`,
+        async runStreamed(prompt) {
+          if (prompt.startsWith('Repair ')) {
+            const error = new Error('request timed out')
+            error.code = 'ETIMEDOUT'
+            throw error
+          }
+          return { events: streamedEvents([JSON.stringify({
+            reasoning: '',
+            text: '',
+            tool_calls: [{ id: 'call-never-executed', name: 'write', arguments_json: '{' }],
+          })]) }
+        },
+      }
+    },
+  }))
+  const options = {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-5.6-sol',
+    sessionId: 'session-tool-retry-limit',
+    messages: [textMessage('user-1', 'write')],
+  }
+  const outcomes = []
+  for (let attempt = 0; attempt <= 2; attempt += 1) {
+    const outcome = await collectStreamFailure(adapter, options)
+    outcomes.push(outcome)
+    if (outcome.error.code !== 'TIMEOUT') break
+  }
+  assert.equal(outcomes.length, 3)
+  assert.equal(outcomes.at(-1).error.code, 'TIMEOUT')
+  assert.ok(outcomes.every(outcome => !outcome.chunks.some(chunk => chunk.type === 'tool-call-delta')))
+  assert.equal(adapter.threadPool.size(), 0)
+  assert.equal(starts, 3)
+})
+
+test('adapter repairs an outer structured response once without repeating visible content', async () => {
+  const prompts = []
+  const adapter = new CodexSubscriptionAdapter({}, () => ({
+    startThread() {
+      return {
+        id: 'thread-outer-repair',
+        async runStreamed(prompt) {
+          prompts.push(prompt)
+          const response = prompts.length === 1
+            ? '{"reasoning":"","text":"already visible"'
+            : JSON.stringify({ reasoning: '', text: 'already visible', tool_calls: [] })
+          return { events: streamedEvents([response], { input_tokens: 2, output_tokens: 1 }) }
+        },
+      }
+    },
+  }))
+  const chunks = await collectStream(adapter, {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-5.6-sol',
+    sessionId: 'session-outer-repair',
+    messages: [textMessage('user-1', 'answer')],
+  })
+  assert.equal(prompts.length, 2)
+  assert.deepEqual(chunks.filter(chunk => chunk.type === 'text-delta').map(chunk => chunk.text), ['already visible'])
+  assert.equal(chunks.filter(chunk => chunk.type === 'usage').length, 1)
+  assert.equal(chunks.at(-1).reason.kind, 'stop')
+})
+
+test('outer repair with unexpected tool calls emits cumulative usage exactly once', async () => {
+  const prompts = []
+  const adapter = new CodexSubscriptionAdapter({}, () => ({
+    startThread() {
+      return {
+        id: 'thread-outer-repair-tools',
+        async runStreamed(prompt) {
+          prompts.push(prompt)
+          const response = prompts.length === 1
+            ? '{"reasoning":"","text":"visible"'
+            : JSON.stringify({
+                reasoning: '',
+                text: '',
+                tool_calls: [{ id: 'call-repair', name: 'read', arguments_json: '{}' }],
+              })
+          return {
+            events: streamedEvents([response], {
+              input_tokens: prompts.length === 1 ? 4 : 3,
+              cached_input_tokens: prompts.length === 1 ? 1 : 1,
+              output_tokens: prompts.length === 1 ? 2 : 5,
+            }),
+          }
+        },
+      }
+    },
+  }))
+
+  const failure = await collectStreamFailure(adapter, {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-5.6-sol',
+    sessionId: 'session-outer-repair-tools',
+    messages: [textMessage('user-outer-repair-tools', 'answer')],
+  })
+  assert.equal(failure.error.code, 'PROTOCOL')
+  assert.equal(prompts.length, 2)
+  assert.deepEqual(failure.chunks.filter(chunk => chunk.type === 'usage').map(chunk => chunk.usage), [{
+    inputTokens: 5,
+    outputTokens: 7,
+    totalTokens: 14,
+    cacheReadTokens: 2,
+  }])
+  assert.deepEqual(failure.chunks.filter(chunk => chunk.type === 'text-delta').map(chunk => chunk.text), ['visible'])
+  assert.equal(failure.chunks.some(chunk => chunk.type === 'tool-call-delta'), false)
 })
 
 test('adapter reuses an append-only DSH session thread and sends only new messages', async () => {

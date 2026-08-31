@@ -1,0 +1,1 @@
+{"reasoning":"","text":"","tool_calls":[{"id":"call-redacted-2","name":"search","arguments_json":"{\"query\":\"REDACTED\",{"}]}

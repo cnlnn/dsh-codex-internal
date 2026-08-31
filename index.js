@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto'
+import { createHash } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { homedir } from 'node:os'
@@ -171,6 +171,21 @@ const RESPONSE_SCHEMA = {
           },
         },
       },
+    },
+  },
+}
+
+const TOOL_REPAIR_RESPONSE_SCHEMA = {
+  ...RESPONSE_SCHEMA,
+  properties: {
+    ...RESPONSE_SCHEMA.properties,
+    reasoning: {
+      ...RESPONSE_SCHEMA.properties.reasoning,
+      description: 'Must be an empty string. Do not repeat the original reasoning.',
+    },
+    text: {
+      ...RESPONSE_SCHEMA.properties.text,
+      description: 'Must be an empty string. Do not repeat the original answer.',
     },
   },
 }
@@ -936,6 +951,265 @@ function parseStructuredResponse(text) {
   return value
 }
 
+function safeToolDiagnostic(value, fallback) {
+  if (typeof value !== 'string' || value.trim().length === 0) return fallback
+  return value.replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 128)
+}
+
+function toolCallLabel(call) {
+  return `id=${JSON.stringify(safeToolDiagnostic(call?.id, '<missing>'))}`
+    + ` name=${JSON.stringify(safeToolDiagnostic(call?.name, '<missing>'))}`
+}
+
+function jsonArgumentIssue(error) {
+  const message = typeof error?.message === 'string' ? error.message : ''
+  const position = /\bposition\s+(\d+)\b/i.exec(message)?.[1]
+  return position === undefined
+    ? 'invalid JSON syntax'
+    : `invalid JSON syntax at character ${position}`
+}
+
+function inspectToolCall(call) {
+  if (call === null || typeof call !== 'object' || Array.isArray(call)) {
+    return { call, repairable: false, issue: 'tool call is not an object' }
+  }
+  const id = typeof call.id === 'string' && call.id.trim().length > 0 ? call.id : undefined
+  const name = typeof call.name === 'string' && call.name.trim().length > 0 ? call.name : undefined
+  if (id === undefined) {
+    return { call, id, name, repairable: false, issue: 'tool call id is missing or empty' }
+  }
+  const unknownKeys = Object.keys(call).filter(key => !['id', 'name', 'arguments_json'].includes(key))
+  if (unknownKeys.length > 0) {
+    return {
+      call,
+      id,
+      name,
+      repairable: id !== undefined && name !== undefined,
+      issue: 'tool call contains unsupported fields',
+    }
+  }
+  if (name === undefined) {
+    return { call, id, name, repairable: false, issue: 'tool call name is missing' }
+  }
+  if (typeof call.arguments_json !== 'string') {
+    return {
+      call,
+      id,
+      name,
+      repairable: id !== undefined,
+      issue: 'arguments_json must be a JSON-encoded object string',
+    }
+  }
+  let parsedArguments
+  try {
+    parsedArguments = JSON.parse(call.arguments_json)
+  } catch (error) {
+    return { call, id, name, repairable: id !== undefined, issue: jsonArgumentIssue(error) }
+  }
+  if (parsedArguments === null || typeof parsedArguments !== 'object' || Array.isArray(parsedArguments)) {
+    return {
+      call,
+      id,
+      name,
+      repairable: id !== undefined,
+      issue: 'arguments_json must encode a non-array JSON object',
+    }
+  }
+  return { call, id, name, parsedArguments, repairable: false, valid: true }
+}
+
+function inspectToolCalls(calls) {
+  const records = calls.map(inspectToolCall)
+  const byId = new Map()
+  for (const [index, record] of records.entries()) {
+    if (record.id === undefined) continue
+    const indexes = byId.get(record.id) ?? []
+    indexes.push(index)
+    byId.set(record.id, indexes)
+  }
+  for (const indexes of byId.values()) {
+    if (indexes.length < 2) continue
+    for (const index of indexes) {
+      records[index] = {
+        ...records[index],
+        repairable: false,
+        valid: false,
+        issue: 'tool call id must be unique',
+      }
+    }
+  }
+  return records
+}
+
+function invalidToolCallError(records, prefix = 'Codex returned invalid DSH tool call') {
+  const shown = records.slice(0, 16).map(record => `${toolCallLabel(record)}: ${record.issue}`)
+  if (records.length > shown.length) shown.push(`and ${records.length - shown.length} more call(s)`)
+  return new LlmError(`${prefix} (${shown.join('; ')}).`, 'PROTOCOL')
+}
+
+function classifyTurnFailure(error, fallback) {
+  const classified = classifySdkError(error ?? new Error(fallback))
+  if (classified.code !== 'CODEX_SDK') return classified
+  return new LlmError(classified.message, 'SERVER', { cause: classified })
+}
+
+function toolCallKey(call) {
+  return JSON.stringify([call.id, call.name])
+}
+
+function parseToolRepairResponse(text) {
+  let value
+  try {
+    value = JSON.parse(text)
+  } catch {
+    throw new LlmError('Codex tool-call repair returned invalid structured output.', 'PROTOCOL')
+  }
+  const keys = value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? Object.keys(value)
+    : []
+  if (value === null || typeof value !== 'object' || Array.isArray(value)
+    || keys.some(key => !['reasoning', 'text', 'tool_calls'].includes(key))
+    || value.reasoning !== '' || value.text !== '' || !Array.isArray(value.tool_calls)) {
+    throw new LlmError('Codex tool-call repair returned visible or invalid structured output.', 'PROTOCOL')
+  }
+  return value
+}
+
+function buildToolCallRepairPrompt(records) {
+  const calls = records.map(record => `- ${toolCallLabel(record)}; issue: ${record.issue}`).join('\n')
+  return [
+    'Repair the invalid DSH tool-call arguments from your immediately preceding response.',
+    'Return only a JSON object with reasoning="", text="", and tool_calls.',
+    'tool_calls must contain exactly the listed calls, in their listed order.',
+    'Keep every listed call id and name byte-for-byte unchanged.',
+    'Return one JSON-encoded non-array object in arguments_json for each listed call.',
+    'Do not execute any tool. Do not add, remove, reorder, rename, or repeat calls.',
+    'Valid calls from the preceding response are intentionally omitted and must not be returned.',
+    'The invalid calls are:',
+    calls,
+  ].join('\n')
+}
+
+function mergeRepairedToolCalls(records, repairedCalls) {
+  const invalid = records.filter(record => !record.valid)
+  if (!Array.isArray(repairedCalls) || repairedCalls.length !== invalid.length) {
+    throw invalidToolCallError(invalid, 'Codex tool-call repair did not preserve the original call count')
+  }
+  const expectedOrder = invalid.map(record => toolCallKey(record))
+  const expected = new Map()
+  for (const record of invalid) {
+    const key = toolCallKey(record)
+    expected.set(key, (expected.get(key) ?? 0) + 1)
+  }
+  const replacements = new Map()
+  for (const [index, call] of repairedCalls.entries()) {
+    const inspected = inspectToolCall(call)
+    if (!inspected.valid || inspected.id === undefined || inspected.name === undefined) {
+      throw invalidToolCallError(invalid, 'Codex tool-call repair returned an invalid replacement')
+    }
+    const key = toolCallKey(inspected)
+    if (key !== expectedOrder[index]) {
+      throw invalidToolCallError(invalid, 'Codex tool-call repair changed call order or identity')
+    }
+    const remaining = expected.get(key) ?? 0
+    if (remaining <= 0) {
+      throw invalidToolCallError(invalid, 'Codex tool-call repair changed a call id or name')
+    }
+    expected.set(key, remaining - 1)
+    const queue = replacements.get(key) ?? []
+    queue.push(inspected)
+    replacements.set(key, queue)
+  }
+  if ([...expected.values()].some(count => count !== 0)) {
+    throw invalidToolCallError(invalid, 'Codex tool-call repair changed a call id or name')
+  }
+  return records.map((record) => {
+    if (record.valid) return record
+    const queue = replacements.get(toolCallKey(record))
+    const repaired = queue?.shift()
+    if (repaired === undefined) {
+      throw invalidToolCallError(invalid, 'Codex tool-call repair omitted a call')
+    }
+    return { ...record, parsedArguments: repaired.parsedArguments, valid: true }
+  })
+}
+
+async function runToolCallRepair(thread, records, signal) {
+  if (signal?.aborted === true) throw new LlmError('Codex tool-call repair was aborted.', 'ABORTED')
+  let usage
+  let turnCompleted = false
+  let finalResponse = ''
+  try {
+    const streamed = await thread.runStreamed(buildToolCallRepairPrompt(records), {
+      outputSchema: TOOL_REPAIR_RESPONSE_SCHEMA,
+      signal,
+    })
+    for await (const event of streamed.events) {
+      if (event.type === 'item.updated' || event.type === 'item.completed') {
+        if (event.item?.type === 'agent_message') finalResponse = event.item.text
+      } else if (event.type === 'turn.completed') {
+        if (event.turn?.status !== undefined && event.turn.status !== 'completed') {
+          throw event.turn.error ?? new Error(`Codex tool-call repair ended with status ${event.turn.status}.`)
+        }
+        usage = addCodexUsage(usage, event.usage)
+        turnCompleted = true
+      } else if (event.type === 'turn.failed') {
+        throw classifyTurnFailure(event.error, 'Codex tool-call repair failed.')
+      } else if (event.type === 'error') {
+        throw classifyTurnFailure(event.error, event.message ?? 'Codex tool-call repair failed.')
+      }
+    }
+    if (signal?.aborted === true) throw new LlmError('Codex tool-call repair was aborted.', 'ABORTED')
+    if (!turnCompleted) throw new Error('Codex tool-call repair ended without a completed turn.')
+    return { response: parseToolRepairResponse(finalResponse), usage }
+  } catch (error) {
+    throw attachCodexUsage(classifySdkError(error), usage)
+  }
+}
+
+function buildStructuredResponseRepairPrompt() {
+  return [
+    'Repair the immediately preceding Codex response for the DSH structured-response contract.',
+    'Return only one valid JSON object with exactly reasoning, text, and tool_calls fields.',
+    'Do not execute any tool while repairing the response.',
+    'Preserve the preceding response content and tool-call ids and names; do not invent, remove, reorder, or repeat calls.',
+    'The DSH adapter will emit the repaired response only after validating its complete structure.',
+  ].join('\n')
+}
+
+async function runStructuredResponseRepair(thread, signal) {
+  if (signal?.aborted === true) throw new LlmError('Codex structured-response repair was aborted.', 'ABORTED')
+  let usage
+  let turnCompleted = false
+  let finalResponse = ''
+  try {
+    const streamed = await thread.runStreamed(buildStructuredResponseRepairPrompt(), {
+      outputSchema: RESPONSE_SCHEMA,
+      signal,
+    })
+    for await (const event of streamed.events) {
+      if (event.type === 'item.updated' || event.type === 'item.completed') {
+        if (event.item?.type === 'agent_message') finalResponse = event.item.text
+      } else if (event.type === 'turn.completed') {
+        if (event.turn?.status !== undefined && event.turn.status !== 'completed') {
+          throw event.turn.error ?? new Error(`Codex structured-response repair ended with status ${event.turn.status}.`)
+        }
+        usage = addCodexUsage(usage, event.usage)
+        turnCompleted = true
+      } else if (event.type === 'turn.failed') {
+        throw classifyTurnFailure(event.error, 'Codex structured-response repair failed.')
+      } else if (event.type === 'error') {
+        throw classifyTurnFailure(event.error, event.message ?? 'Codex structured-response repair failed.')
+      }
+    }
+    if (signal?.aborted === true) throw new LlmError('Codex structured-response repair was aborted.', 'ABORTED')
+    if (!turnCompleted) throw new Error('Codex structured-response repair ended without a completed turn.')
+    return { response: parseStructuredResponse(finalResponse), usage }
+  } catch (error) {
+    throw attachCodexUsage(classifySdkError(error), usage)
+  }
+}
+
 /** Decode the usable prefix of one JSON string field from partial structured output. */
 export function partialJsonString(text, key) {
   const match = new RegExp(`"${key}"\\s*:\\s*"`).exec(text)
@@ -1072,6 +1346,129 @@ function errorDetails(error) {
   return details.join(': ')
 }
 
+function errorFields(error, fields = new Set(), seen = new Set(), depth = 0) {
+  if (error === null || (typeof error !== 'object' && typeof error !== 'function') || seen.has(error) || depth > 3) {
+    return fields
+  }
+  seen.add(error)
+  for (const key of ['code', 'type', 'name']) {
+    try {
+      if (typeof error[key] === 'string' && error[key].length > 0) fields.add(error[key])
+    } catch {
+      // A third-party error must not prevent classification of its safe fields.
+    }
+  }
+  for (const key of ['cause', 'error', 'detail', 'details', 'data', 'failure']) {
+    try {
+      const child = error[key]
+      if (child !== null && typeof child === 'object') errorFields(child, fields, seen, depth + 1)
+    } catch {
+      // Ignore hostile or unavailable nested error properties.
+    }
+  }
+  return fields
+}
+
+function errorStatus(error, seen = new Set(), depth = 0) {
+  if (error === null || (typeof error !== 'object' && typeof error !== 'function') || seen.has(error) || depth > 3) {
+    return undefined
+  }
+  seen.add(error)
+  try {
+    if (Number.isInteger(error.status) && error.status >= 100 && error.status <= 599) return error.status
+    if (Number.isInteger(error.statusCode) && error.statusCode >= 100 && error.statusCode <= 599) return error.statusCode
+  } catch {
+    // Continue through a nested cause when a provider error uses accessors.
+  }
+  for (const key of ['cause', 'error', 'detail', 'details', 'data', 'failure']) {
+    try {
+      const status = errorStatus(error[key], seen, depth + 1)
+      if (status !== undefined) return status
+    } catch {
+      // Ignore unavailable nested error properties.
+    }
+  }
+  return undefined
+}
+
+const TRANSPORT_ERROR_CODES = new Set([
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'ECONNABORTED',
+  'EPIPE',
+  'ENETDOWN',
+  'ENETRESET',
+  'ENETUNREACH',
+  'EHOSTDOWN',
+  'EHOSTUNREACH',
+  'EAI_AGAIN',
+  'UND_ERR_SOCKET',
+  'CONNECTION_RESET',
+  'CONNECTION_CLOSED',
+])
+
+const TIMEOUT_ERROR_CODES = new Set([
+  'ETIMEDOUT',
+  'ESOCKETTIMEDOUT',
+  'ERR_SOCKET_TIMEOUT',
+  'TIMEOUT',
+  'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_HEADERS_TIMEOUT',
+  'UND_ERR_BODY_TIMEOUT',
+])
+
+const SERVER_ERROR_CODES = new Set([
+  'SERVER',
+  'SERVER_ERROR',
+  'BAD_GATEWAY',
+  'SERVICE_UNAVAILABLE',
+  'INTERNAL_SERVER_ERROR',
+  'CLI_EXIT',
+  'CODEX_CLI_EXIT',
+  'PROCESS_EXIT',
+  'PROCESS_EXITED',
+  'CLI_PREMATURE_EXIT',
+  'ERR_STREAM_PREMATURE_CLOSE',
+  'ERR_CHILD_PROCESS_STDIO_MAXBUFFER',
+  'ERR_CODEX_PROCESS_EXIT',
+  'ERR_CLI_PREMATURE_EXIT',
+])
+
+function transientSdkCode(error, details) {
+  const codes = [...errorFields(error)].map(code => code.toUpperCase())
+  if (codes.some(code => TIMEOUT_ERROR_CODES.has(code))) return 'TIMEOUT'
+  if (codes.some(code => TRANSPORT_ERROR_CODES.has(code))) return 'TRANSPORT'
+  if (codes.some(code => SERVER_ERROR_CODES.has(code))) return 'SERVER'
+  const status = errorStatus(error)
+  if (status !== undefined && status >= 500) return 'SERVER'
+  // A 408 is the one client error that remains explicitly retryable. Other
+  // 4xx statuses are provider-side request/auth failures, so their wording
+  // must not turn them into a transient transport/server classification.
+  if (status === 408) return 'TIMEOUT'
+  const clientStatus = status !== undefined && status >= 400 && status < 500
+  if (!clientStatus && /\b(?:http(?:\s+status)?(?:\s+code)?|status(?:\s+code)?|status_code|response(?:\s+status)?)\s*[:=]?\s*(?:500|502|503|504)\b/i.test(details)) {
+    return 'SERVER'
+  }
+  if (!clientStatus && /\b(?:timed?\s*out|timeout|deadline exceeded|request timeout)\b/i.test(details)) return 'TIMEOUT'
+  if (!clientStatus && /\b(?:econnreset|econnrefused|econnaborted|epipe|enet(?:down|reset|unreach)|ehost(?:down|unreach)|eai_again|socket[\s_-]?hang[\s_-]?up|socket[\s_-]?closed|closed[\s_-]?connection|connection[\s_-]?reset|connection[\s_-]?refused|connection[\s_-]?aborted|connection[\s_-]?closed)\b/i.test(details)) {
+    return 'TRANSPORT'
+  }
+  if (!clientStatus && /\b(?:bad[\s_-]?gateway|service[\s_-]?unavailable|(?:internal[\s_-]?)?server[\s_-]?error)\b/i.test(details)) {
+    return 'SERVER'
+  }
+  if (!clientStatus && /\b(?:premature(?:ly)?|unexpected)\s+(?:end|eof|exit)|\b(?:codex|cli|child)\s+(?:process|command)?\s*(?:exited|closed|terminated)|\b(?:cli|codex)\s+(?:premature\s+exit|exit(?:ed)?\s+prematurely)|\bprocess\s+exited\b/i.test(details)) {
+    return 'SERVER'
+  }
+  return undefined
+}
+
+function statusFailureCode(status) {
+  if (status === 401 || status === 403) return 'AUTH'
+  if (status === 429) return 'RATE_LIMIT'
+  if (status === 408) return 'TIMEOUT'
+  return undefined
+}
+
 function isCodexContextOverflow(details) {
   return isContextWindowExceededError(details)
     || /\bcontext[\s_-]?(?:window|length)[\s_-]?(?:exceeded|overflow(?:ed)?|limit[\s_-]?exceeded)\b/i.test(details)
@@ -1083,18 +1480,45 @@ export function classifySdkError(error) {
   const details = errorDetails(error)
   const message = details.length > 0 ? details : String(error)
   const contextOverflow = isCodexContextOverflow(details)
+  const transientCode = transientSdkCode(error, details)
+  const explicitCodes = [...errorFields(error)].map(code => code.toUpperCase())
+  const statusCode = statusFailureCode(errorStatus(error))
   if (error instanceof LlmError) {
-    if (error.code === CONTEXT_WINDOW_EXCEEDED_CODE || !contextOverflow) return error
-    const options = { cause: error }
-    for (const key of ['status', 'providerRetryAfterMs', 'requestId']) {
-      if (error.failure?.[key] !== undefined) options[key] = error.failure[key]
+    if (error.code === CONTEXT_WINDOW_EXCEEDED_CODE) return error
+    if (contextOverflow) {
+      const options = { cause: error }
+      for (const key of ['status', 'providerRetryAfterMs', 'requestId']) {
+        if (error.failure?.[key] !== undefined) options[key] = error.failure[key]
+      }
+      return new LlmError(message, CONTEXT_WINDOW_EXCEEDED_CODE, options)
     }
-    return new LlmError(message, CONTEXT_WINDOW_EXCEEDED_CODE, options)
+    if (statusCode !== undefined
+      && (error.code === 'CODEX_SDK' || error.code === 'CODEX_APP_SERVER' || error.code === 'CODEX_QUOTA')) {
+      const options = { cause: error }
+      for (const key of ['status', 'providerRetryAfterMs', 'requestId']) {
+        if (error.failure?.[key] !== undefined) options[key] = error.failure[key]
+      }
+      return new LlmError(message, statusCode, options)
+    }
+    if (transientCode !== undefined
+      && (error.code === 'CODEX_SDK' || error.code === 'CODEX_APP_SERVER' || error.code === 'CODEX_QUOTA')) {
+      const options = { cause: error }
+      for (const key of ['status', 'providerRetryAfterMs', 'requestId']) {
+        if (error.failure?.[key] !== undefined) options[key] = error.failure[key]
+      }
+      return new LlmError(message, transientCode, options)
+    }
+    return error
   }
   if (contextOverflow) return new LlmError(message, CONTEXT_WINDOW_EXCEEDED_CODE, { cause: error })
   if (/aborted|abort/i.test(message)) return new LlmError(message, 'ABORTED', { cause: error })
+  if (statusCode !== undefined) return new LlmError(message, statusCode, { cause: error })
   if (/401|403|authentication|login/i.test(message)) return new LlmError(message, 'AUTH', { cause: error })
   if (/429|rate.?limit/i.test(message)) return new LlmError(message, 'RATE_LIMIT', { cause: error })
+  for (const code of ['ABORTED', 'AUTH', 'PROTOCOL', 'RATE_LIMIT', 'CONTEXT_WINDOW_EXCEEDED']) {
+    if (explicitCodes.includes(code)) return new LlmError(message, code, { cause: error })
+  }
+  if (transientCode !== undefined) return new LlmError(message, transientCode, { cause: error })
   return new LlmError(message, 'CODEX_SDK', { cause: error })
 }
 
@@ -1642,6 +2066,7 @@ export class CodexSubscriptionAdapter extends LlmAdapter {
     let assistantBlocks = []
     let usage
     let usageEmitted = false
+    let repairAttempted = false
     const assistantBlockMap = new Map()
 
     try {
@@ -1734,12 +2159,49 @@ export class CodexSubscriptionAdapter extends LlmAdapter {
       }
 
       if (!turnCompleted) throw new Error('Codex turn ended without a completed turn.')
-      const response = parseStructuredResponse(finalResponse)
+      let response
+      let responseWasRepaired = false
+      try {
+        response = parseStructuredResponse(finalResponse)
+      } catch (error) {
+        // A response containing an unparseable tool_calls field is not safe to
+        // reconstruct without knowing which calls were actually requested.
+        // The arguments_json case is repaired below after the outer JSON parses.
+        if (isAuxiliary || /"tool_calls"\s*:/i.test(finalResponse)) throw error
+        repairAttempted = true
+        try {
+          const repaired = await runStructuredResponseRepair(lease.thread, options.signal)
+          usage = addCodexUsage(usage, repaired.usage)
+          if (repaired.response.tool_calls.length > 0) {
+            // The repair usage is already merged into this turn. Do not attach
+            // it to the thrown error or the outer catch would count it twice.
+            throw new LlmError('Codex structured-response repair cannot safely reconstruct tool calls.', 'PROTOCOL')
+          }
+          response = repaired.response
+          responseWasRepaired = true
+        } catch (repairError) {
+          if (repairError?.code === 'PROTOCOL') {
+            throw attachCodexUsage(error, codexUsageFromError(repairError))
+          }
+          throw repairError
+        }
+      }
       if (isCompaction && response.tool_calls.length > 0) {
         throw new LlmError('Codex compaction attempted to call a DSH tool.', 'PROTOCOL')
       }
       if (isCompaction && response.text.length === 0) {
         throw new LlmError('Codex compaction returned no summary text.', 'PROTOCOL')
+      }
+      if (options.signal?.aborted === true) {
+        throw new LlmError('Codex request was aborted.', 'ABORTED')
+      }
+      if (responseWasRepaired) {
+        if ((reasoningEnded && response.reasoning !== reasoning)
+          || (textEnded && response.text !== visibleText)
+          || !response.reasoning.startsWith(reasoning)
+          || !response.text.startsWith(visibleText)) {
+          throw new LlmError('Codex structured-response repair changed already emitted content.', 'PROTOCOL')
+        }
       }
       if (response.reasoning.length > reasoning.length) {
         if (!reasoningStarted) {
@@ -1770,35 +2232,39 @@ export class CodexSubscriptionAdapter extends LlmAdapter {
         yield { type: 'block-end', index: textIndex, block }
       }
 
+      let toolCallRecords = inspectToolCalls(response.tool_calls)
+      const invalidToolCalls = toolCallRecords.filter(record => !record.valid)
+      if (invalidToolCalls.length > 0) {
+        const originalError = invalidToolCallError(invalidToolCalls)
+        if (isAuxiliary || repairAttempted || invalidToolCalls.some(record => !record.repairable)) {
+          throw originalError
+        }
+        repairAttempted = true
+        try {
+          const repaired = await runToolCallRepair(lease.thread, invalidToolCalls, options.signal)
+          usage = addCodexUsage(usage, repaired.usage)
+          toolCallRecords = mergeRepairedToolCalls(toolCallRecords, repaired.response.tool_calls)
+        } catch (error) {
+          if (error?.code === 'PROTOCOL') {
+            throw attachCodexUsage(originalError, codexUsageFromError(error))
+          }
+          throw error
+        }
+      }
+
       let index = nextIndex
 
-      for (const call of response.tool_calls) {
-        if (call === null || typeof call !== 'object' || Array.isArray(call)
-          || typeof call.name !== 'string' || call.name.length === 0
-          || typeof call.arguments_json !== 'string') {
-          throw new LlmError('Codex returned an invalid DSH tool call.', 'PROTOCOL')
-        }
-        let parsedArguments
-        try {
-          parsedArguments = JSON.parse(call.arguments_json)
-        } catch (error) {
-          throw new LlmError('Codex returned invalid JSON for a DSH tool call.', 'PROTOCOL', { cause: error })
-        }
-        if (parsedArguments === null || typeof parsedArguments !== 'object' || Array.isArray(parsedArguments)) {
-          throw new LlmError('Codex returned non-object arguments for a DSH tool call.', 'PROTOCOL')
-        }
-        const id = CallId(typeof call.id === 'string' && call.id.length > 0
-          ? call.id
-          : `codex-${randomUUID()}`)
-        const argumentsText = JSON.stringify(parsedArguments)
-        const block = { type: 'tool-call', id, name: call.name, arguments: argumentsText }
+      for (const record of toolCallRecords) {
+        const id = CallId(record.id)
+        const argumentsText = JSON.stringify(record.parsedArguments)
+        const block = { type: 'tool-call', id, name: record.name, arguments: argumentsText }
         assistantBlockMap.set(index, block)
         yield { type: 'block-start', index, blockType: 'tool-call' }
         yield {
           type: 'tool-call-delta',
           index,
           id,
-          name: call.name,
+          name: record.name,
           argumentsDelta: argumentsText,
         }
         yield { type: 'block-end', index, block }

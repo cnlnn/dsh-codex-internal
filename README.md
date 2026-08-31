@@ -16,6 +16,7 @@ This is a community integration and is not an official OpenAI or DeepSeek plugin
 - Working directory, network access, custom Model IDs, reasoning efforts, context windows, and output limits in `Settings → Plugins → Plugin Configuration → Codex`
 - Direct DSH conversation flow with no slash command and no intermediary model
 - DSH-native text, reasoning, tool-call, finish, and usage events
+- One bounded internal repair for malformed structured responses or tool-call arguments; transient Codex transport, timeout, and CLI failures retain DSH retry semantics
 - Automatic DSH compaction uses a conservative adapter budget; oversized histories are sent as complete, ordered input segments through isolated, hierarchical passes, while summary quality depends on the model
 - Linux, macOS, and native Windows support on x64 and arm64
 
