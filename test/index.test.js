@@ -1,20 +1,20 @@
 import assert from 'node:assert/strict'
-import { EventEmitter, getEventListeners } from 'node:events'
+import { spawnSync } from 'node:child_process'
+import { getEventListeners } from 'node:events'
 import { readFile } from 'node:fs/promises'
-import { PassThrough } from 'node:stream'
 import test from 'node:test'
-import { Codex } from '@openai/codex-sdk'
 import { Context } from '@deepseek-ai/cordis'
 import { LlmError, LlmRuntime } from '@deepseek-ai/dsh-llm'
 import {
   buildCodexPrompt,
   buildCompactionPrompt,
-  CODEX_CLI_PATH,
   CODEX_ADAPTER_CONTEXT_WINDOW,
   CODEX_COMPACTION_MAX_CALLS,
   CODEX_COMPACTION_MAX_CALLS_PER_LEVEL,
   CODEX_SAFE_PROMPT_CHAR_BUDGET,
   CODEX_PROVIDER,
+  CodexAppServerClient,
+  CodexAuthBridge,
   CodexSubscriptionAdapter,
   CodexThreadPool,
   codexAssistantFingerprint,
@@ -25,8 +25,11 @@ import {
   prepareSegmentedCompaction,
   partialJsonString,
   readCodexRateLimits,
+  registerAuthRoutes,
+  sanitizeCodexAccountStatus,
   sanitizedEnvironment,
   splitCompactionSource,
+  apply,
 } from '../index.js'
 
 function streamedEvents(parts, usage = null) {
@@ -37,6 +40,62 @@ function streamedEvents(parts, usage = null) {
     yield { type: 'item.completed', item: { type: 'agent_message', id: 'message-1', text: parts.at(-1) } }
     yield { type: 'turn.completed', usage }
   })()
+}
+
+class FakeAppServerRpc {
+  constructor(onRequest = () => undefined) {
+    this.onRequest = onRequest
+    this.calls = []
+    this.listeners = new Map()
+    this.generation = 1
+    this.diagnostics = { pid: 100, initialized: true }
+    this.turns = 0
+    this.closed = false
+  }
+
+  subscribe(method, callback) {
+    let handlers = this.listeners.get(method)
+    if (handlers === undefined) {
+      handlers = new Set()
+      this.listeners.set(method, handlers)
+    }
+    handlers.add(callback)
+    return () => handlers.delete(callback)
+  }
+
+  emit(method, params) {
+    for (const callback of this.listeners.get(method) ?? []) callback(params)
+  }
+
+  async request(method, params, options) {
+    this.calls.push({ method, params, options })
+    const custom = await this.onRequest(method, params, options)
+    if (custom !== undefined) return custom
+    if (method === 'thread/start' || method === 'thread/resume') {
+      if (method === 'thread/resume') {
+        this.generation += 1
+        this.diagnostics = { pid: 100 + this.generation, initialized: true }
+      }
+      return { thread: { id: 'thread-1' } }
+    }
+    if (method === 'thread/unsubscribe') return {}
+    if (method === 'turn/start') return { turn: { id: `turn-${++this.turns}` } }
+    if (method === 'turn/interrupt') return { turn: { id: params.turnId, status: 'interrupted' } }
+    const error = new Error(`Method not supported: ${method}`)
+    error.code = -32601
+    error.rpcError = { code: -32601, message: 'Method not supported' }
+    throw error
+  }
+
+  crash(error = Object.assign(new Error('app-server exited'), { code: 'APP_SERVER_EXIT' })) {
+    this.diagnostics = { pid: null, initialized: false }
+    this.emit('crash', error)
+  }
+
+  close() {
+    this.closed = true
+    this.diagnostics = { ...this.diagnostics, pid: null, initialized: false, closed: true }
+  }
 }
 
 async function collectStream(adapter, options) {
@@ -70,41 +129,54 @@ function textMessage(id, text, role = 'user') {
   }
 }
 
+function deferred() {
+  let resolve
+  let reject
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
+}
+
+function fakeResponse() {
+  return {
+    statusCode: null,
+    headers: null,
+    body: '',
+    writeHead(status, headers) {
+      this.statusCode = status
+      this.headers = headers
+    },
+    end(body = '') {
+      this.body = body
+    },
+  }
+}
+
 test('account discovery drops hidden and ChatGPT-incompatible catalog rows', async () => {
-  const child = new EventEmitter()
-  child.stdout = new PassThrough()
-  child.stderr = new PassThrough()
-  child.kill = () => true
-  child.stdin = {
-    write(line) {
-      const request = JSON.parse(line)
-      queueMicrotask(() => {
-        if (request.id === 1) {
-          child.stdout.write(`${JSON.stringify({ id: 1, result: {} })}\n`)
-        } else {
-          child.stdout.write(`${JSON.stringify({
-            id: 2,
-            result: {
-              data: [
-                { model: 'gpt-5.6-sol', displayName: 'Sol', hidden: false },
-                { model: 'gpt-5.2', displayName: 'Unsupported', hidden: false },
-                { model: 'gpt-reserve', displayName: 'Hidden', hidden: true },
-              ],
-            },
-          })}\n`)
-        }
-      })
-      return true
+  const requests = []
+  const appServerClient = {
+    async request(method, params, options) {
+      requests.push({ method, params, options })
+      return {
+        data: [
+          { model: 'gpt-5.6-sol', displayName: 'Sol', hidden: false },
+          { model: 'gpt-5.2', displayName: 'Unsupported', hidden: false },
+          { model: 'gpt-reserve', displayName: 'Hidden', hidden: true },
+        ],
+      }
     },
   }
 
-  const models = await discoverCodexCatalog(undefined, (command, args) => {
-    assert.equal(command, process.execPath)
-    assert.equal(args[0], CODEX_CLI_PATH)
-    return child
-  })
+  const models = await discoverCodexCatalog(undefined, appServerClient)
   assert.deepEqual(models.map(model => model.id), ['gpt-5.6-sol'])
   assert.equal(models[0].contextWindow, CODEX_ADAPTER_CONTEXT_WINDOW)
+  assert.deepEqual(requests, [{
+    method: 'model/list',
+    params: { includeHidden: false, limit: 100 },
+    options: { signal: undefined, timeoutMs: 30_000 },
+  }])
 })
 
 test('sanitizedEnvironment excludes ambient credentials', () => {
@@ -125,45 +197,236 @@ test('sanitizedEnvironment excludes ambient credentials', () => {
 })
 
 test('quota lookup exposes rate-limit windows without account identity', async () => {
-  const child = new EventEmitter()
-  child.stdout = new PassThrough()
-  child.stderr = new PassThrough()
-  child.kill = () => true
-  child.stdin = {
-    write(line) {
-      const request = JSON.parse(line)
-      queueMicrotask(() => {
-        child.stdout.write(`${JSON.stringify(request.id === 1
-          ? { id: 1, result: {} }
-          : {
-              id: 2,
-              result: {
-                rateLimits: null,
-                rateLimitsByLimitId: {
-                  codex: {
-                    limitId: 'codex',
-                    primary: { usedPercent: 36, windowDurationMins: 10_080, resetsAt: 1_788_452_814 },
-                    secondary: null,
-                    credits: { hasCredits: false, unlimited: false, balance: '0' },
-                    planType: 'pro',
-                  },
-                },
-                rateLimitResetCredits: { availableCount: 0, credits: [] },
-                email: 'must-not-leak@example.test',
-              },
-            })}\n`)
-      })
-      return true
+  const requests = []
+  const quota = await readCodexRateLimits(undefined, {
+    async request(method, params, options) {
+      requests.push({ method, params, options })
+      return {
+        rateLimits: null,
+        rateLimitsByLimitId: {
+          codex: {
+            limitId: 'codex',
+            primary: { usedPercent: 36, windowDurationMins: 10_080, resetsAt: 1_788_452_814 },
+            secondary: null,
+            credits: { hasCredits: false, unlimited: false, balance: '0' },
+            planType: 'pro',
+          },
+        },
+        rateLimitResetCredits: { availableCount: 0, credits: [] },
+        email: 'must-not-leak@example.test',
+      }
     },
-  }
-
-  const quota = await readCodexRateLimits(undefined, () => child)
+  })
   assert.equal(quota.buckets[0].name, 'Codex')
   assert.equal(quota.buckets[0].planType, 'pro')
   assert.equal(quota.buckets[0].primary.usedPercent, 36)
   assert.equal(quota.buckets[0].primary.windowDurationMins, 10_080)
   assert.equal(quota.resetCredits, 0)
   assert.equal(JSON.stringify(quota).includes('must-not-leak'), false)
+  assert.deepEqual(requests, [{
+    method: 'account/rateLimits/read',
+    params: undefined,
+    options: { signal: undefined, timeoutMs: 15_000 },
+  }])
+})
+
+test('auth status exposes only ChatGPT sign-in state and plan', async () => {
+  assert.deepEqual(sanitizeCodexAccountStatus({
+    account: { type: 'chatgpt', email: 'hidden@example.test', planType: 'pro' },
+  }), {
+    signedIn: true,
+    authMode: 'chatgpt',
+    planType: 'pro',
+  })
+  assert.deepEqual(sanitizeCodexAccountStatus({
+    account: { type: 'apiKey', email: 'hidden@example.test', planType: 'pro' },
+  }), {
+    signedIn: false,
+    authMode: 'apiKey',
+    planType: null,
+  })
+
+  const calls = []
+  const bridge = new CodexAuthBridge(() => ({
+    async request(method, params, options) {
+      calls.push({ method, params, options })
+      return { account: { type: 'chatgpt', email: 'must-not-return@example.test', planType: 'plus' } }
+    },
+  }))
+  const status = await bridge.status()
+  assert.deepEqual(status, { signedIn: true, authMode: 'chatgpt', planType: 'plus' })
+  assert.equal(JSON.stringify(status).includes('must-not-return'), false)
+  assert.deepEqual(calls, [{
+    method: 'account/read',
+    params: { refreshToken: false },
+    options: { timeoutMs: 15_000 },
+  }])
+})
+
+test('auth login prefers device code and falls back only for explicit unsupported errors', async () => {
+  const calls = []
+  const client = {
+    async request(method, params) {
+      calls.push({ method, params })
+      if (method === 'account/login/start' && params.type === 'chatgptDeviceCode') {
+        throw Object.assign(new Error('login type is unsupported'), { code: 'UNSUPPORTED_LOGIN_TYPE' })
+      }
+      return {
+        type: 'chatgpt',
+        loginId: 'login-1',
+        authUrl: 'https://auth.example.test/continue',
+        email: 'must-not-return@example.test',
+      }
+    },
+  }
+  const bridge = new CodexAuthBridge(() => client)
+  const result = await bridge.startLogin()
+  assert.deepEqual(result, {
+    type: 'chatgpt',
+    loginId: 'login-1',
+    authUrl: 'https://auth.example.test/continue',
+  })
+  assert.deepEqual(calls, [
+    { method: 'account/login/start', params: { type: 'chatgptDeviceCode' } },
+    { method: 'account/login/start', params: { type: 'chatgpt' } },
+  ])
+  assert.equal(JSON.stringify(result).includes('must-not-return'), false)
+})
+
+test('auth login is shared, cancel uses only the in-memory login id, and logout is account-wide', async () => {
+  const gate = deferred()
+  const calls = []
+  const client = {
+    async request(method, params) {
+      calls.push({ method, params })
+      if (method === 'account/login/start') return gate.promise
+      return {}
+    },
+  }
+  const bridge = new CodexAuthBridge(() => client)
+  const first = bridge.startLogin()
+  const second = bridge.startLogin()
+  await Promise.resolve()
+  assert.equal(calls.filter(call => call.method === 'account/login/start').length, 1)
+  gate.resolve({ type: 'chatgptDeviceCode', loginId: 'owned-login', verificationUrl: 'https://verify', userCode: 'ABCD-EFGH' })
+  assert.deepEqual(await Promise.all([first, second]), [
+    { type: 'chatgptDeviceCode', loginId: 'owned-login', verificationUrl: 'https://verify', userCode: 'ABCD-EFGH' },
+    { type: 'chatgptDeviceCode', loginId: 'owned-login', verificationUrl: 'https://verify', userCode: 'ABCD-EFGH' },
+  ])
+  await bridge.cancelLogin('attacker-supplied-login')
+  assert.deepEqual(calls.at(-1), { method: 'account/login/cancel', params: { loginId: 'owned-login' } })
+  await bridge.logout()
+  assert.deepEqual(calls.at(-1), { method: 'account/logout', params: undefined })
+})
+
+test('auth routes enforce methods and the browser-only POST header', async () => {
+  const client = {
+    async request(method, params) {
+      if (method === 'account/read') return { account: null }
+      if (method === 'account/login/start') return {
+        type: params.type,
+        loginId: 'route-login',
+        verificationUrl: 'https://verify',
+        userCode: 'ROUTE-CODE',
+      }
+      return {}
+    },
+  }
+  const bridge = new CodexAuthBridge(() => client)
+  const routes = []
+  const dispose = registerAuthRoutes({ webServer: { register(route) { routes.push(route); return () => {} } } }, bridge)
+  assert.equal(typeof dispose, 'function')
+
+  const statusRoute = routes.find(route => route.path.endsWith('/auth/status'))
+  const loginRoute = routes.find(route => route.path.endsWith('/auth/login'))
+  const wrongMethod = fakeResponse()
+  await statusRoute.handler({ method: 'POST', headers: {} }, wrongMethod)
+  assert.equal(wrongMethod.statusCode, 405)
+  assert.equal(wrongMethod.headers['cache-control'], 'no-store')
+
+  const missingHeader = fakeResponse()
+  await loginRoute.handler({ method: 'POST', headers: { 'content-type': 'application/json' } }, missingHeader)
+  assert.equal(missingHeader.statusCode, 403)
+
+  const accepted = fakeResponse()
+  await loginRoute.handler({
+    method: 'POST',
+    headers: { 'content-type': 'application/json; charset=utf-8', 'x-dsh-codex-auth': '1' },
+  }, accepted)
+  assert.equal(accepted.statusCode, 200)
+  assert.deepEqual(JSON.parse(accepted.body).value, {
+    type: 'chatgptDeviceCode', loginId: 'route-login', verificationUrl: 'https://verify', userCode: 'ROUTE-CODE',
+  })
+})
+
+test('auth route registration rolls back partial duplicates and combined disposal removes all routes', () => {
+  const routes = new Map()
+  let registrations = 0
+  const ctx = {
+    webServer: {
+      register(route) {
+        registrations += 1
+        if (routes.has(route.path)) throw new Error(`duplicate route: ${route.path}`)
+        routes.set(route.path, route)
+        let disposed = false
+        return () => {
+          if (disposed) return
+          disposed = true
+          routes.delete(route.path)
+        }
+      },
+    },
+  }
+  const bridge = new CodexAuthBridge(() => ({ request: async () => ({}) }))
+  const dispose = registerAuthRoutes(ctx, bridge)
+  assert.equal(registrations, 4)
+  assert.equal(routes.size, 4)
+  dispose()
+  assert.equal(routes.size, 0)
+
+  routes.set('/plugins/@local/dsh-codex-internal/api/auth/cancel', {})
+  assert.throws(() => registerAuthRoutes(ctx, bridge), /duplicate route/)
+  assert.deepEqual([...routes.keys()], ['/plugins/@local/dsh-codex-internal/api/auth/cancel'])
+})
+
+test('apply registers quota and auth routes as disposable effects', () => {
+  const routes = new Map()
+  const effects = []
+  const ctx = {
+    webServer: {
+      register(route) {
+        if (routes.has(route.path)) throw new Error(`duplicate route: ${route.path}`)
+        routes.set(route.path, route)
+        let disposed = false
+        return () => {
+          if (disposed) return
+          disposed = true
+          routes.delete(route.path)
+        }
+      },
+    },
+    effect(execute) {
+      const dispose = execute()
+      effects.push(dispose)
+      return dispose
+    },
+    inject() {},
+    llm: {
+      registerModelDiscovery() {},
+      registerAdapter() {},
+    },
+  }
+
+  apply(ctx, { models: [] })
+  assert.deepEqual([...routes.keys()].sort(), [
+    '/plugins/@local/dsh-codex-internal/api/auth/cancel',
+    '/plugins/@local/dsh-codex-internal/api/auth/login',
+    '/plugins/@local/dsh-codex-internal/api/auth/logout',
+    '/plugins/@local/dsh-codex-internal/api/auth/status',
+    '/plugins/@local/dsh-codex-internal/api/quota',
+  ])
+  for (const dispose of [...effects].reverse()) dispose?.()
+  assert.equal(routes.size, 0)
 })
 
 test('adapter advertises every visible Codex account model and its reasoning efforts', async () => {
@@ -305,7 +568,7 @@ test('context overflow classification is conservative and keeps the original cau
     'RATE_LIMIT')
   assert.equal(classifySdkError(Object.assign(new Error('socket closed'), { code: 'ECONNRESET' })).code,
     'TRANSPORT')
-  const wrappedTransport = new LlmError('Codex SDK failed', 'CODEX_SDK', {
+  const wrappedTransport = new LlmError('Codex app-server failed', 'CODEX_APP_SERVER', {
     cause: Object.assign(new Error('socket closed'), { code: 'ECONNRESET' }),
   })
   assert.equal(classifySdkError(wrappedTransport).code, 'TRANSPORT')
@@ -340,6 +603,79 @@ test('context overflow classification is conservative and keeps the original cau
   assert.equal(classifySdkError(new Error('authentication request reset')).code, 'AUTH')
   assert.equal(classifySdkError({ code: 'PROTOCOL', message: 'malformed response' }).code, 'PROTOCOL')
   assert.equal(classifySdkError(new Error('invalid JSON response')).code, 'CODEX_SDK')
+})
+
+test('Codex request-body parser failures are retryable without widening PROTOCOL', async () => {
+  const fixture = JSON.parse(await readFile(
+    new URL('./fixtures/codex-request-body-parse-failure-redacted.json', import.meta.url),
+    'utf8',
+  ))
+  assert.equal(fixture.observed.turn, 14)
+  assert.deepEqual([fixture.observed.finishSeq, fixture.observed.turnEndSeq], [6877, 6879])
+  assert.equal(classifySdkError(fixture.failure).code, 'SERVER')
+
+  const requestBodyError = new Error(
+    'Failed to parse the request body as JSON: expected value at line 1 column 1',
+  )
+  assert.equal(classifySdkError(requestBodyError).code, 'SERVER')
+  assert.equal(classifySdkError(new Error(
+    'Failed to parse the request body as JSON: unexpected end of JSON input',
+  )).code, 'SERVER')
+  const codeBearingEnd = Object.assign(new Error('unexpected end of JSON input'), { code: 'CODEX_SDK' })
+  assert.equal(classifySdkError(codeBearingEnd).code, 'SERVER')
+  const codeBearingEmpty = Object.assign(new Error('empty response body'), { code: 'CODEX_SDK' })
+  assert.equal(classifySdkError(codeBearingEmpty).code, 'SERVER')
+  assert.equal(classifySdkError(new Error('unexpected end of JSON input')).code, 'CODEX_SDK')
+  assert.equal(classifySdkError({ status: 400, message: 'request timed out' }).code, 'CODEX_SDK')
+  assert.equal(classifySdkError(new LlmError(
+    'Codex structured output was truncated: unexpected end of JSON input',
+    'PROTOCOL',
+  )).code, 'PROTOCOL')
+  const retryAfter = new LlmError(
+    'Failed to parse the request body as JSON: expected value at line 1 column 1',
+    'CODEX_SDK',
+    { providerRetryAfterMs: 1250 },
+  )
+  const classified = classifySdkError(retryAfter)
+  assert.equal(classified.code, 'SERVER')
+  assert.equal(classified.failure.providerRetryAfterMs, 1250)
+})
+
+test('app-server TurnError codexErrorInfo preserves RPC codes and maps retry classes', () => {
+  const classifyTurn = (codexErrorInfo, extra = {}) => classifySdkError({
+    code: 'CODEX_APP_SERVER',
+    message: 'Codex turn failed',
+    codexErrorInfo,
+    ...extra,
+  })
+  assert.equal(classifyTurn({ errorType: 'contextWindowExceeded' }).code, 'CONTEXT_WINDOW_EXCEEDED')
+  for (const code of ['serverOverloaded', 'internalServerError', 'responseTooManyFailedAttempts']) {
+    assert.equal(classifyTurn({ code }).code, 'SERVER')
+  }
+  for (const code of ['httpConnectionFailed', 'responseStreamConnectionFailed', 'responseStreamDisconnected']) {
+    assert.equal(classifyTurn({ code }).code, 'TRANSPORT')
+  }
+  for (const code of ['usageLimitExceeded', 'sessionBudgetExceeded']) {
+    assert.equal(classifyTurn({ code }).code, 'RATE_LIMIT')
+  }
+  assert.equal(classifyTurn({ code: 'unauthorized' }).code, 'AUTH')
+  assert.equal(classifyTurn({ code: 'serverOverloaded', httpStatusCode: 401 }).code, 'AUTH')
+  assert.equal(classifyTurn({ code: 'serverOverloaded', httpStatusCode: 403 }).code, 'AUTH')
+  assert.equal(classifyTurn({ code: 'serverOverloaded', httpStatusCode: 408 }).code, 'TIMEOUT')
+  assert.equal(classifyTurn({ code: 'serverOverloaded', httpStatusCode: 429 }).code, 'RATE_LIMIT')
+  assert.equal(classifyTurn({ code: 'responseStreamDisconnected', httpStatusCode: 500 }).code, 'SERVER')
+  assert.equal(classifyTurn({ code: 'responseStreamDisconnected', data: { httpStatusCode: 502 } }).code, 'SERVER')
+  assert.equal(classifyTurn({ responseStreamDisconnected: { reason: 'socket closed' } }).code, 'TRANSPORT')
+  assert.equal(classifyTurn({ nested: { responseTooManyFailedAttempts: {} } }).code, 'SERVER')
+  assert.equal(classifyTurn({ nested: { responseStreamDisconnected: { httpStatusCode: 503 } } }).code, 'SERVER')
+
+  const rpcError = { code: -32001, message: 'Server overloaded' }
+  const wrapped = classifySdkError(new LlmError('turn failed', 'CODEX_APP_SERVER', {
+    cause: { rpcError },
+  }))
+  assert.equal(wrapped.code, 'SERVER')
+  assert.equal(wrapped.cause.cause.rpcError.code, -32001)
+  assert.equal(classifySdkError(rpcError).code, 'SERVER')
 })
 
 test('adapter prepareCall exposes the conservative DSH context contract', async () => {
@@ -569,13 +905,407 @@ test('catalog shares failures and refreshes after its cache TTL', async () => {
   assert.equal(calls, 3)
 })
 
-test('real Codex SDK accepts a safe-size lazy input without login or process start', async () => {
-  const codex = new Codex({ env: {}, config: { forced_login_method: 'chatgpt' } })
-  const thread = codex.startThread({ model: 'gpt-5.6-sol' })
-  assert.equal(thread.id, null)
-  assert.equal('compact' in thread, false)
-  const streamed = await thread.runStreamed('x'.repeat(CODEX_SAFE_PROMPT_CHAR_BUDGET - 1))
-  assert.equal(typeof streamed.events[Symbol.asyncIterator], 'function')
+test('app-server compatibility bridge maps v2 events, usage, and request controls', async () => {
+  const response = JSON.stringify({ reasoning: '', text: 'done', tool_calls: [] })
+  const rpc = new FakeAppServerRpc((method) => {
+    if (method !== 'turn/start') return undefined
+    queueMicrotask(() => {
+      rpc.emit('thread/started', { thread: { id: 'other-thread' } })
+      rpc.emit('item/agentMessage/delta', {
+        threadId: 'other-thread',
+        turnId: 'turn-1',
+        itemId: 'other-item',
+        delta: 'must be ignored',
+      })
+      rpc.emit('error', { threadId: 'thread-1', turnId: 'turn-1', willRetry: true, error: { message: 'retrying' } })
+      rpc.emit('item/started', {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: { type: 'agentMessage', id: 'item-1', text: '' },
+      })
+      rpc.emit('item/agentMessage/delta', {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        itemId: 'item-1',
+        delta: response,
+      })
+      rpc.emit('item/completed', {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: { type: 'agentMessage', id: 'item-1', text: response },
+      })
+      rpc.emit('thread/tokenUsage/updated', {
+        threadId: 'thread-1',
+        tokenUsage: { last: { inputTokens: 999 } },
+      })
+      rpc.emit('thread/tokenUsage/updated', {
+        threadId: 'other-thread',
+        turnId: 'turn-1',
+        tokenUsage: { last: { inputTokens: 998 } },
+      })
+      rpc.emit('thread/tokenUsage/updated', {
+        threadId: 'thread-1',
+        turnId: 'wrong-turn',
+        tokenUsage: { last: { inputTokens: 997 } },
+      })
+      rpc.emit('thread/tokenUsage/updated', {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        tokenUsage: {
+          total: { totalTokens: 99 },
+          last: {
+            inputTokens: 20,
+            cachedInputTokens: 3,
+            cacheWriteInputTokens: 2,
+            outputTokens: 4,
+            reasoningOutputTokens: 1,
+          },
+        },
+      })
+      rpc.emit('turn/completed', {
+        threadId: 'thread-1',
+        turn: { id: 'turn-1', status: 'completed' },
+      })
+    })
+    return { turn: { id: 'turn-1', status: 'inProgress' } }
+  })
+  const client = new CodexAppServerClient({ rpc })
+  const thread = client.startThread({
+    model: 'gpt-5.6-sol',
+    workingDirectory: '/workspace',
+    sandboxMode: 'read-only',
+    approvalPolicy: 'never',
+    networkAccessEnabled: true,
+    modelReasoningEffort: 'high',
+    threadSource: 'dsh-test',
+  })
+  const outputSchema = { type: 'object', required: ['text'] }
+  const streamed = await thread.runStreamed('prompt', { outputSchema })
+  const events = await collectIterable(streamed.events)
+  assert.deepEqual(events, [
+    { type: 'item.updated', item: { type: 'agent_message', id: 'item-1', text: response } },
+    { type: 'item.completed', item: { type: 'agent_message', id: 'item-1', text: response } },
+    {
+      type: 'turn.completed',
+      turn: { id: 'turn-1', status: 'completed' },
+      usage: {
+        input_tokens: 20,
+        cached_input_tokens: 3,
+        cache_write_input_tokens: 2,
+        output_tokens: 4,
+        reasoning_output_tokens: 1,
+      },
+    },
+  ])
+  const start = rpc.calls.find(call => call.method === 'thread/start')
+  assert.deepEqual(start.params, {
+    model: 'gpt-5.6-sol',
+    modelProvider: 'openai',
+    cwd: '/workspace',
+    approvalPolicy: 'never',
+    sandbox: 'read-only',
+    config: { 'sandbox_workspace_write.network_access': true },
+    threadSource: 'dsh-test',
+  })
+  const turn = rpc.calls.find(call => call.method === 'turn/start')
+  assert.deepEqual(turn.params, {
+    threadId: 'thread-1',
+    input: [{ type: 'text', text: 'prompt', text_elements: [] }],
+    model: 'gpt-5.6-sol',
+    effort: 'high',
+    cwd: '/workspace',
+    approvalPolicy: 'never',
+    sandboxPolicy: { type: 'readOnly', networkAccess: true },
+    outputSchema,
+  })
+})
+
+test('app-server compatibility bridge interrupts an active turn on abort', async () => {
+  const controller = new AbortController()
+  const rpc = new FakeAppServerRpc()
+  const thread = new CodexAppServerClient({ rpc }).startThread({ model: 'gpt-5.6-sol' })
+  const streamed = await thread.runStreamed('wait', { signal: controller.signal })
+  const pending = streamed.events.next()
+  await new Promise(resolve => setImmediate(resolve))
+  controller.abort()
+  await assert.rejects(pending, error => error.code === 'ABORTED')
+  const interrupt = rpc.calls.find(call => call.method === 'turn/interrupt')
+  assert.deepEqual(interrupt.params, { threadId: 'thread-1', turnId: 'turn-1' })
+})
+
+test('strict unhandled-rejection mode handles an abort queued by thread/start', () => {
+  const indexUrl = new URL('../index.js', import.meta.url).href
+  const script = `
+    import { CodexAppServerClient } from ${JSON.stringify(indexUrl)}
+
+    const controller = new AbortController()
+    const calls = []
+    const listeners = new Map()
+    const rpc = {
+      generation: 1,
+      diagnostics: { pid: 7, initialized: true },
+      closed: false,
+      subscribe(method, callback) {
+        let handlers = listeners.get(method)
+        if (handlers === undefined) {
+          handlers = new Set()
+          listeners.set(method, handlers)
+        }
+        handlers.add(callback)
+        return () => handlers.delete(callback)
+      },
+      request(method, params) {
+        calls.push(method)
+        if (method === 'thread/start') {
+          queueMicrotask(() => controller.abort())
+          return Promise.resolve({ thread: { id: 'thread-early-abort' } })
+        }
+        if (method === 'thread/unsubscribe') return Promise.resolve({})
+        if (method === 'turn/start') throw new Error('turn/start must not be sent')
+        throw Object.assign(new Error('Method not supported'), { code: -32601 })
+      },
+      close() {
+        this.closed = true
+      },
+    }
+
+    const client = new CodexAppServerClient({ rpc })
+    const thread = client.startThread({ model: 'gpt-5.6-sol' })
+    const streamed = await thread.runStreamed('abort immediately', { signal: controller.signal })
+    try {
+      await streamed.events.next()
+      process.exitCode = 2
+    } catch (error) {
+      if (error?.code !== 'ABORTED' || calls.includes('turn/start')) process.exitCode = 3
+    }
+    await client.close()
+  `
+  const result = spawnSync(process.execPath, [
+    '--unhandled-rejections=strict',
+    '--input-type=module',
+    '--eval',
+    script,
+  ], {
+    cwd: process.cwd(),
+    encoding: 'utf8',
+  })
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+  assert.doesNotMatch(result.stderr, /UnhandledPromiseRejection|unhandled rejection/i)
+})
+
+test('app-server bridge keeps a late turn/start alive and interrupts once after early abort', async () => {
+  const controller = new AbortController()
+  const start = deferred()
+  const rpc = new FakeAppServerRpc(method => method === 'turn/start' ? start.promise : undefined)
+  const thread = new CodexAppServerClient({ rpc }).startThread({ model: 'gpt-5.6-sol' })
+  const streamed = await thread.runStreamed('late start', {
+    signal: controller.signal,
+    timeoutMs: 1_000,
+    wireTimeoutMs: 200,
+  })
+  const pending = streamed.events.next()
+  await new Promise(resolve => setImmediate(resolve))
+  controller.abort()
+  await assert.rejects(pending, error => error.code === 'ABORTED')
+  assert.equal(rpc.calls.filter(call => call.method === 'turn/interrupt').length, 0)
+  assert.equal(rpc.calls.find(call => call.method === 'turn/start').options.signal, undefined)
+  assert.equal(rpc.calls.find(call => call.method === 'turn/start').options.timeoutMs, 200)
+
+  start.resolve({ turn: { id: 'turn-late' } })
+  await new Promise(resolve => setImmediate(resolve))
+  const interrupts = rpc.calls.filter(call => call.method === 'turn/interrupt')
+  assert.equal(interrupts.length, 1)
+  assert.deepEqual(interrupts[0].params, { threadId: 'thread-1', turnId: 'turn-late' })
+})
+
+test('app-server bridge handles turn/started before a late turn/start response without duplicate interrupt', async () => {
+  const controller = new AbortController()
+  const start = deferred()
+  const rpc = new FakeAppServerRpc(method => method === 'turn/start' ? start.promise : undefined)
+  const thread = new CodexAppServerClient({ rpc }).startThread({ model: 'gpt-5.6-sol' })
+  const streamed = await thread.runStreamed('notified start', {
+    signal: controller.signal,
+    timeoutMs: 1_000,
+  })
+  const pending = streamed.events.next()
+  await new Promise(resolve => setImmediate(resolve))
+  rpc.emit('turn/started', { threadId: 'thread-1', turn: { id: 'turn-notified' } })
+  controller.abort()
+  await assert.rejects(pending, error => error.code === 'ABORTED')
+  assert.equal(rpc.calls.filter(call => call.method === 'turn/interrupt').length, 1)
+  start.resolve({ turn: { id: 'turn-notified' } })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(rpc.calls.filter(call => call.method === 'turn/interrupt').length, 1)
+})
+
+test('app-server bridge times out local turn/start promptly and interrupts a late turn', async () => {
+  const start = deferred()
+  const rpc = new FakeAppServerRpc(method => method === 'turn/start' ? start.promise : undefined)
+  const thread = new CodexAppServerClient({ rpc }).startThread({ model: 'gpt-5.6-sol' })
+  const streamed = await thread.runStreamed('timed start', { timeoutMs: 10, wireTimeoutMs: 50 })
+  const pending = streamed.events.next()
+  await assert.rejects(pending, error => error.code === 'TIMEOUT')
+  assert.equal(rpc.calls.filter(call => call.method === 'turn/interrupt').length, 0)
+  start.resolve({ turn: { id: 'turn-timeout' } })
+  await new Promise(resolve => setImmediate(resolve))
+  const interrupts = rpc.calls.filter(call => call.method === 'turn/interrupt')
+  assert.equal(interrupts.length, 1)
+  assert.equal(interrupts[0].params.turnId, 'turn-timeout')
+})
+
+test('app-server compatibility bridge resumes a thread after a disconnected generation', async () => {
+  const rpc = new FakeAppServerRpc()
+  const client = new CodexAppServerClient({ rpc })
+  const thread = client.startThread({ model: 'gpt-5.6-sol' })
+  const first = await thread.runStreamed('first')
+  const pending = first.events.next()
+  await new Promise(resolve => setImmediate(resolve))
+  rpc.crash()
+  await assert.rejects(pending, error => error.code === 'APP_SERVER_EXIT')
+
+  rpc.onRequest = (method) => {
+    if (method !== 'turn/start') return undefined
+    queueMicrotask(() => {
+      rpc.emit('item/completed', {
+        threadId: 'thread-1',
+        turnId: 'turn-2',
+        item: {
+          type: 'agentMessage',
+          id: 'item-2',
+          text: JSON.stringify({ reasoning: '', text: 'recovered', tool_calls: [] }),
+        },
+      })
+      rpc.emit('turn/completed', {
+        threadId: 'thread-1',
+        turn: { id: 'turn-2', status: 'completed' },
+      })
+    })
+    return { turn: { id: 'turn-2', status: 'inProgress' } }
+  }
+  const recovered = await thread.runStreamed('retry')
+  const events = await collectIterable(recovered.events)
+  assert.equal(events.at(-1).type, 'turn.completed')
+  assert.deepEqual(rpc.calls.map(call => call.method), [
+    'thread/start',
+    'turn/start',
+    'thread/resume',
+    'turn/start',
+  ])
+})
+
+test('model discovery and quota lookup share one adapter app-server client', async () => {
+  const rpc = new FakeAppServerRpc()
+  rpc.onRequest = (method) => {
+    if (method === 'model/list') {
+      return { data: [{ model: 'gpt-shared', displayName: 'Shared', hidden: false }] }
+    }
+    if (method === 'account/rateLimits/read') {
+      return {
+        rateLimitsByLimitId: {
+          codex: {
+            limitId: 'codex',
+            primary: { usedPercent: 12, windowDurationMins: 60, resetsAt: 1_788_452_814 },
+            planType: 'pro',
+          },
+        },
+      }
+    }
+    return undefined
+  }
+  const shared = new CodexAppServerClient({ rpc })
+  let factoryCalls = 0
+  const adapter = new CodexSubscriptionAdapter({}, () => {
+    factoryCalls += 1
+    return shared
+  })
+  assert.deepEqual((await adapter.listModels(CODEX_PROVIDER)).map(model => model.id), ['gpt-shared'])
+  const quota = await readCodexRateLimits(undefined, adapter.getClient())
+  assert.equal(quota.buckets[0].primary.usedPercent, 12)
+  assert.equal(factoryCalls, 1)
+  assert.deepEqual(rpc.calls.map(call => call.method), ['model/list', 'account/rateLimits/read'])
+  await adapter.close()
+  assert.equal(rpc.closed, true)
+})
+
+test('thread subscription release is idempotent and never respawns a dead app-server', async () => {
+  const rpc = new FakeAppServerRpc()
+  const client = new CodexAppServerClient({ rpc })
+  const thread = client.startThread({ model: 'gpt-5.6-sol' })
+  await thread.ensureThread()
+  assert.equal(client.threads.has(thread), true)
+  assert.equal(rpc.calls.filter(call => call.method === 'thread/subscribe').length, 0)
+
+  await Promise.all([thread.unsubscribe(), thread.unsubscribe()])
+  assert.equal(rpc.calls.filter(call => call.method === 'thread/unsubscribe').length, 1)
+  assert.equal(client.threads.has(thread), false)
+  await thread.unsubscribe()
+  assert.equal(rpc.calls.filter(call => call.method === 'thread/unsubscribe').length, 1)
+
+  rpc.crash()
+  await thread.unsubscribe()
+  assert.equal(rpc.calls.filter(call => call.method === 'thread/unsubscribe').length, 1)
+  const callCount = rpc.calls.length
+  await thread.unsubscribe()
+  assert.equal(rpc.calls.length, callCount)
+
+  client.close()
+  await thread.unsubscribe()
+  assert.equal(rpc.calls.length, callCount)
+})
+
+test('concurrent app-server streams require strict thread and turn notification scope', async () => {
+  const rpc = new FakeAppServerRpc((method, params) => {
+    if (method === 'thread/start') return { thread: { id: params.model === 'stream-a' ? 'thread-a' : 'thread-b' } }
+    if (method === 'turn/start') return { turn: { id: params.threadId === 'thread-a' ? 'turn-a' : 'turn-b' } }
+    return undefined
+  })
+  const client = new CodexAppServerClient({ rpc })
+  const streamA = await client.startThread({ model: 'stream-a' }).runStreamed('a')
+  const streamB = await client.startThread({ model: 'stream-b' }).runStreamed('b')
+  const iteratorA = streamA.events[Symbol.asyncIterator]()
+  const iteratorB = streamB.events[Symbol.asyncIterator]()
+  let aResolved = false
+  const firstA = iteratorA.next().then(value => {
+    aResolved = true
+    return value
+  })
+  const firstB = iteratorB.next()
+  await new Promise(resolve => setImmediate(resolve))
+
+  rpc.emit('item/agentMessage/delta', {
+    threadId: 'thread-a',
+    turnId: 'turn-a',
+    itemId: 'item-a',
+    delta: 'A',
+  })
+  rpc.emit('turn/completed', { threadId: 'thread-a', turn: { status: 'completed' } })
+  rpc.emit('item/completed', {
+    threadId: 'thread-a',
+    item: { type: 'agentMessage', id: 'item-a', text: 'wrong scope' },
+  })
+  rpc.emit('item/agentMessage/delta', {
+    threadId: 'thread-b',
+    turnId: 'turn-b',
+    itemId: 'item-b',
+    delta: 'B',
+  })
+  assert.equal((await firstA).value.item.text, 'A')
+  assert.equal((await firstB).value.item.text, 'B')
+  assert.equal(aResolved, true)
+
+  const doneA = iteratorA.next()
+  const doneB = iteratorB.next()
+  rpc.emit('turn/completed', {
+    threadId: 'thread-a',
+    turn: { id: 'turn-a', status: 'completed' },
+  })
+  rpc.emit('turn/completed', {
+    threadId: 'thread-b',
+    turn: { id: 'turn-b', status: 'completed' },
+  })
+  assert.equal((await doneA).value.type, 'turn.completed')
+  assert.equal((await doneB).value.type, 'turn.completed')
+  await Promise.all([iteratorA.next(), iteratorB.next()])
 })
 
 test('partialJsonString decodes streamed JSON string prefixes', () => {
@@ -1583,7 +2313,13 @@ test('transient repair failure is retryable without replaying tools, then the lo
   assert.equal(starts, 2)
   const runtime = new LlmRuntime(new Context())
   runtime.registerAdapter([CODEX_PROVIDER], adapter)
-  assert.ok(runtime.providerRetryPolicy(CODEX_PROVIDER).retryableCodes.includes('TRANSPORT'))
+  const retryPolicy = runtime.providerRetryPolicy(CODEX_PROVIDER)
+  assert.ok(retryPolicy.retryableCodes.includes('SERVER'))
+  assert.ok(retryPolicy.retryableCodes.includes('TRANSPORT'))
+  assert.equal(retryPolicy.maxRetries, 5)
+  assert.equal(retryPolicy.initialDelayMs, 500)
+  assert.equal(retryPolicy.maxDelayMs, 10_000)
+  assert.equal(retryPolicy.jitterRatio, 0.1)
 
   const failingAdapter = new CodexSubscriptionAdapter({}, () => ({
     startThread() {
@@ -1614,6 +2350,67 @@ test('transient repair failure is retryable without replaying tools, then the lo
   }))
   assert.equal(runtimeChunks.at(-1).reason.kind, 'error')
   assert.equal(runtimeChunks.at(-1).reason.failure.code, 'TRANSPORT')
+})
+
+test('request-body parse failure is retryable before tool dispatch', async () => {
+  let starts = 0
+  const adapter = new CodexSubscriptionAdapter({}, () => ({
+    startThread() {
+      starts += 1
+      const first = starts === 1
+      return {
+        id: `thread-request-body-${starts}`,
+        async runStreamed(prompt) {
+          if (first) {
+            const error = new Error(
+              'Failed to parse the request body as JSON: expected value at line 1 column 1',
+            )
+            error.code = 'CODEX_SDK'
+            throw error
+          }
+          return { events: streamedEvents([JSON.stringify(prompt.includes('tool-result')
+            ? { reasoning: '', text: 'done', tool_calls: [] }
+            : {
+                reasoning: '',
+                text: '',
+                tool_calls: [{ id: 'call-once', name: 'read', arguments_json: '{"path":"a"}' }],
+              })]) }
+        },
+      }
+    },
+  }))
+  const options = {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-5.6-sol',
+    sessionId: 'session-request-body',
+    messages: [textMessage('user-1', 'read a')],
+  }
+  const failure = await collectStreamFailure(adapter, options)
+  assert.equal(failure.error.code, 'SERVER')
+  assert.equal(failure.chunks.some(chunk => chunk.type === 'tool-call-delta'), false)
+  assert.equal(adapter.threadPool.size(), 0)
+
+  const toolChunks = await collectStream(adapter, options)
+  assert.equal(toolChunks.filter(chunk => chunk.type === 'tool-call-delta').length, 1)
+  const finished = await collectStream(adapter, {
+    ...options,
+    messages: [
+      ...options.messages,
+      {
+        id: 'assistant-1',
+        role: 'assistant',
+        content: [{ type: 'tool-call', id: 'call-once', name: 'read', arguments: '{"path":"a"}' }],
+      },
+      {
+        id: 'tool-1',
+        role: 'user',
+        source: { kind: 'tool', callId: 'call-once' },
+        content: [{ type: 'tool-result', toolCallId: 'call-once', content: [{ type: 'text', text: 'file' }] }],
+      },
+    ],
+  })
+  assert.equal(finished.at(-1).reason.kind, 'stop')
+  assert.equal(starts, 2)
 })
 
 test('bounded transient repair retries end with an explicit error and an idle pool', async () => {
@@ -2669,6 +3466,118 @@ test('thread pool invalidation blocks late releases from restoring a session', (
   assert.equal(created, 3)
 })
 
+test('thread pool unsubscribes exactly once on expiry, eviction, failure, replacement, and isolated release', () => {
+  const lineage = (messageCount, continuation = false) => ({
+    contextKey: 'pool-cleanup',
+    messageKeys: Array.from({ length: messageCount }, (_, index) => String(index)),
+    messageContentKeys: Array.from({ length: messageCount }, (_, index) => index === 1 && continuation
+      ? codexAssistantFingerprint([])
+      : String(index)),
+    messageCount,
+  })
+  const options = { model: 'gpt-5.6-sol', sandboxMode: 'read-only' }
+  let now = 0
+  let created = 0
+  const threads = []
+  const create = () => {
+    const thread = {
+      id: `cleanup-thread-${++created}`,
+      unsubscribed: 0,
+      unsubscribe() {
+        this.unsubscribed += 1
+      },
+    }
+    threads.push(thread)
+    return thread
+  }
+  const pool = new CodexThreadPool({ maxEntries: 1, idleMs: 10, now: () => now })
+
+  const retained = pool.acquire({
+    sessionId: 'cleanup-retained',
+    lineage: lineage(1),
+    threadOptions: options,
+    createThread: create,
+  })
+  retained.release([])
+  const reused = pool.acquire({
+    sessionId: 'cleanup-retained',
+    lineage: lineage(3, true),
+    threadOptions: options,
+    createThread: create,
+  })
+  reused.release([])
+  assert.equal(retained.thread.unsubscribed, 0)
+
+  now = 10
+  pool.prune()
+  assert.equal(retained.thread.unsubscribed, 1)
+  pool.prune()
+  assert.equal(retained.thread.unsubscribed, 1)
+
+  const failed = pool.acquire({
+    sessionId: 'cleanup-failed',
+    lineage: lineage(1),
+    threadOptions: options,
+    createThread: create,
+  })
+  failed.invalidate()
+  assert.equal(failed.thread.unsubscribed, 1)
+
+  const isolated = pool.acquireIsolated({
+    sessionId: 'cleanup-isolated',
+    lineage: lineage(1),
+    threadOptions: options,
+    createThread: create,
+  })
+  isolated.release([])
+  assert.equal(isolated.thread.unsubscribed, 1)
+
+  const replaced = pool.acquire({
+    sessionId: 'cleanup-replaced',
+    lineage: lineage(1),
+    threadOptions: options,
+    createThread: create,
+  })
+  replaced.release([])
+  const replacement = pool.acquire({
+    sessionId: 'cleanup-replaced',
+    lineage: lineage(1),
+    threadOptions: { ...options, model: 'gpt-5.5' },
+    createThread: create,
+  })
+  assert.equal(replaced.thread.unsubscribed, 1)
+  replacement.invalidate()
+  assert.equal(replacement.thread.unsubscribed, 1)
+
+  const busy = pool.acquire({
+    sessionId: 'cleanup-busy',
+    lineage: lineage(1),
+    threadOptions: options,
+    createThread: create,
+  })
+  pool.invalidateSession('cleanup-busy')
+  assert.equal(busy.thread.unsubscribed, 0)
+  busy.invalidate()
+  assert.equal(busy.thread.unsubscribed, 1)
+
+  const lruPool = new CodexThreadPool({ maxEntries: 1, idleMs: 60_000, now: () => 0 })
+  const lruA = lruPool.acquire({
+    sessionId: 'cleanup-lru-a',
+    lineage: lineage(1),
+    threadOptions: options,
+    createThread: create,
+  })
+  lruA.release([])
+  const lruB = lruPool.acquire({
+    sessionId: 'cleanup-lru-b',
+    lineage: lineage(1),
+    threadOptions: options,
+    createThread: create,
+  })
+  lruB.release([])
+  assert.equal(lruA.thread.unsubscribed, 1)
+})
+
 test('client exposes Codex model controls in plugin configuration', async () => {
   const client = await readFile(new URL('../lib/client.js', import.meta.url), 'utf8')
   const server = await readFile(new URL('../index.js', import.meta.url), 'utf8')
@@ -2681,6 +3590,16 @@ test('client exposes Codex model controls in plugin configuration', async () => 
   assert.match(client, /api\.llm\.discoverModels/)
   assert.match(client, /Codex 额度/)
   assert.match(client, /API_ROOT.*quota/s)
+  assert.match(client, /\/auth\/status/)
+  assert.match(client, /\/auth\/login/)
+  assert.match(client, /\/auth\/cancel/)
+  assert.match(client, /\/auth\/logout/)
+  assert.match(client, /verificationUrl/)
+  assert.match(client, /userCode/)
+  assert.match(client, /setInterval/)
+  assert.match(client, /confirm/)
+  assert.match(client, /x-dsh-codex-auth/)
+  assert.doesNotMatch(client, /email|auth\.json|api[_ -]?key|\btoken\b/i)
   const saveBody = client.slice(client.indexOf('const save = async'), client.indexOf('const reset = async'))
   assert.equal(saveBody.match(/\bconst models\b/g)?.length, 1)
   assert.match(saveBody, /const persistedModels/)

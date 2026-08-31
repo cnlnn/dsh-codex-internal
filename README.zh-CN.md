@@ -1,14 +1,18 @@
-# DSH Codex 订阅模型提供方
+# DSH Codex OAuth Bridge
 
 [English](README.md) | 简体中文
 
-把 ChatGPT/Codex 订阅接入 DeepSeek Harness，作为原生模型提供方使用。`Codex` 会直接出现在 DSH 标准模型选择器中，模型目录和推理强度来自当前登录账号。
+通过图形化 OAuth Bridge，把官方 Codex ChatGPT 登录接入 DeepSeek Harness。插件将 ChatGPT 认证交给官方 Codex app-server 保管；DSH 中的第三方模型继续使用各自的原生 provider，不经过本插件。
 
 这是社区集成项目，并非 OpenAI 或 DeepSeek 官方插件。
 
 ## 产品特性
 
-- DSH 标准模型选择器中的原生 `Codex` 提供方
+- `设置 → 插件 → 插件配置 → Codex` 中的图形化 ChatGPT 登录
+- 只显示登录状态和套餐，不暴露账号身份
+- 支持 device code 验证链接、自动轮询登录状态和取消登录
+- 退出登录前明确提示会影响同系统 Codex CLI
+- DSH 标准模型选择器中的原生 `Codex` 订阅提供方
 - 从当前 Codex 账号实时获取模型目录
 - 按模型展示可用推理强度
 - 显示当前 Codex 账号的滚动额度、剩余比例和重置时间
@@ -22,11 +26,13 @@
 
 ## 接入方式
 
-插件使用 OpenAI 官方 `@openai/codex-sdk` 和 `@openai/codex`。ChatGPT 登录、令牌刷新、模型目录和额度读取均由官方 Codex 运行时负责，插件本身不实现 OAuth，也不接收 API Key。
+插件使用 OpenAI 官方 `@openai/codex` app-server。ChatGPT 登录和刷新均由官方运行时负责；插件不读取或复制认证文件，不处理 API Key，也不返回账号身份。DSH 第三方模型仍由各自配置的原生 provider 处理。
+
+插件可以与 CC Switch 共存。插件启动 app-server 进程时会显式选择内置 `openai` 提供方、`chatgpt` 登录方式并关闭请求压缩，因此 CC Switch 的全局提供方和压缩设置不会改写 DSH 请求。DSH 的工作目录、网络访问、模型和推理强度仍由插件配置控制；其他 Codex 命令继续使用各自的全局设置。
 
 每个活动中的 DSH 会话会在内存中复用一个 Codex 线程，并要求完整请求历史保持追加形式。首个回合之后，插件只发送新增的历史消息，让 Codex 能够复用提示缓存。缺少会话 ID、并发调用（返回 `SESSION_BUSY`）、失败后的重试、历史编辑或分叉，以及模型、推理强度或运行参数变化，都会启动隔离线程或进入明确的失败路径。`session-title` 和 `compaction` 辅助调用不会进入主线程池；`compaction` 会先使主会话 lineage 失效。插件不会持久化线程状态。Codex 返回结构化文本、推理摘要和 DSH 工具调用，工具执行继续使用 DSH 原有工具循环。
 
-当 Codex 没有公布容量时，适配器向 DSH 报告保守的 256,000 token 上下文预算。当完整 compaction prompt 超过 900,000 字符的 SDK 安全预算，插件会在消息和 block 边界分段，并为超大文本与 tool-result 保留有序切片；所有输入分段都会完整、按顺序送入隔离线程，中间摘要只在隔离线程中处理，摘要质量取决于模型，最终仅向 DSH 暴露一份摘要，同时合并全部中间用量。
+当 Codex 没有公布容量时，适配器向 DSH 报告保守的 256,000 token 上下文预算。当完整 compaction prompt 超过 app-server/runtime 的 900,000 字符安全预算，插件会在消息和 block 边界分段，并为超大文本与 tool-result 保留有序切片；所有输入分段都会完整、按顺序送入隔离线程，中间摘要只在隔离线程中处理，摘要质量取决于模型，最终仅向 DSH 暴露一份摘要，同时合并全部中间用量。
 
 默认运行参数：
 
@@ -46,11 +52,11 @@
 | macOS | Intel x64、Apple silicon |
 | Windows | x64、arm64 |
 
-运行环境包括 Node.js 22.19+、DeepSeek Harness Web Profile，以及同一系统账号下的 Codex 登录。
+运行环境包括 Node.js 22.19+ 和 DeepSeek Harness Web Profile；图形化登录使用运行 DSH 的同一系统账号。
 
 ## 安装
 
-查看当前 Codex 登录状态：
+图形化登录是主要配置方式。CLI 状态命令仅用于可选诊断：
 
 ```sh
 codex login status
@@ -76,11 +82,12 @@ dsh web
 
 ## 使用
 
-1. 打开 DSH 标准模型选择器。
-2. 选择 `Codex`、模型和推理强度。
-3. 发送普通消息。
+1. 打开 `设置 → 插件 → 插件配置 → Codex`。
+2. 选择“登录 ChatGPT”，完成界面显示的 device code 或浏览器登录流程。
+3. 登录状态变为已登录后，在 DSH 标准模型选择器中刷新或选择 `Codex`。
+4. 发送普通消息。DSH 第三方 provider 继续使用各自的原生配置。
 
-`设置 → 插件 → 插件配置 → Codex` 支持选择工作目录、控制网络访问、刷新实时目录和添加自定义 Model ID。自定义模型还可以设置可选推理强度、默认推理强度、上下文窗口和最大输出；自定义 ID 会按填写内容直接交给当前 Codex 账号处理。全部 Codex 设置都在图形界面中完成，不需要编辑 `settings.yaml`。
+该卡片还支持选择工作目录、控制网络访问、刷新实时目录和添加自定义 Model ID。自定义模型还可以设置可选推理强度、默认推理强度、上下文窗口和最大输出。全部 Bridge 和 Codex 设置都在图形界面中完成，不需要编辑 `settings.yaml`。
 
 ## 卸载
 
@@ -88,7 +95,7 @@ dsh web
 dsh plugin --profile web remove @local/dsh-codex-internal
 ```
 
-卸载后 Codex 提供方会从 DSH Web Profile 中移除。本地源码仓库、Codex 登录和 Codex 自有历史保持独立。
+卸载后 Bridge 和 Codex 订阅提供方会从 DSH Web Profile 中移除。本地源码仓库、Codex 登录和 Codex 自有历史保持独立。选择“退出登录”会退出同一 app-server 账号，因此也会影响同系统账号下运行的 Codex CLI。
 
 ## 开发
 

@@ -1,0 +1,12 @@
+{
+  "observed": {
+    "turn": 14,
+    "step": 93,
+    "finishSeq": 6877,
+    "turnEndSeq": 6879
+  },
+  "failure": {
+    "message": "Failed to parse the request body as JSON: expected value at line 1 column 1",
+    "code": "CODEX_SDK"
+  }
+}

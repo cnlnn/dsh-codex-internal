@@ -1,6 +1,4 @@
 import { createHash } from 'node:crypto'
-import { spawn } from 'node:child_process'
-import { createRequire } from 'node:module'
 import { homedir } from 'node:os'
 import z from '@deepseek-ai/schemastery'
 import {
@@ -12,16 +10,27 @@ import {
   isContextWindowExceededError,
 } from '@deepseek-ai/dsh-llm'
 import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
-import { Codex } from '@openai/codex-sdk'
+import {
+  CODEX_APP_SERVER_CONFIG_OVERRIDES,
+  CODEX_CLI_PATH,
+  CodexAppServerRpc,
+  sanitizedEnvironment,
+} from './lib/app-server.js'
 
 export const name = 'llm-codex-subscription'
 export const inject = ['llm', 'webServer']
 export const CODEX_PROVIDER = 'codex'
 export const CODEX_SETTINGS_NAMESPACE = settingsNamespace('llm-codex-subscription')
-export const CODEX_CLI_PATH = createRequire(import.meta.url).resolve('@openai/codex/bin/codex.js')
+export { CODEX_APP_SERVER_CONFIG_OVERRIDES, CODEX_CLI_PATH, sanitizedEnvironment }
 const API_ROOT = '/plugins/@local/dsh-codex-internal/api'
 export const CODEX_THREAD_POOL_MAX = 8
 export const CODEX_THREAD_POOL_IDLE_MS = 30 * 60 * 1000
+/**
+ * Keep the wire-level turn/start request bounded after DSH has already given
+ * up locally. A late turn id can still be interrupted during this window,
+ * while a permanently silent app-server cannot leave a request pending.
+ */
+export const CODEX_TURN_START_WIRE_TIMEOUT_MS = 60_000
 /**
  * Conservative capacity exposed to DSH when Codex does not publish one.
  * This is an adapter budget, not a claim about the model's native limit.
@@ -108,41 +117,6 @@ export const Config = z.object({
   models: z.array(catalogModel).default([]),
 })
 
-const SAFE_ENV_KEYS = new Set([
-  'APPDATA',
-  'CODEX_CA_CERTIFICATE',
-  'CODEX_HOME',
-  'COMSPEC',
-  'DBUS_SESSION_BUS_ADDRESS',
-  'HOME',
-  'HOMEDRIVE',
-  'HOMEPATH',
-  'LANG',
-  'LC_ALL',
-  'LC_CTYPE',
-  'LOGNAME',
-  'LOCALAPPDATA',
-  'PATH',
-  'PATHEXT',
-  'PROGRAMDATA',
-  'PROGRAMFILES',
-  'PROGRAMFILES(X86)',
-  'SHELL',
-  'SSL_CERT_FILE',
-  'SYSTEMROOT',
-  'TEMP',
-  'TERM',
-  'TMP',
-  'TMPDIR',
-  'USER',
-  'USERPROFILE',
-  'WINDIR',
-  'XDG_CACHE_HOME',
-  'XDG_CONFIG_HOME',
-  'XDG_DATA_HOME',
-  'XDG_RUNTIME_DIR',
-])
-
 const RESPONSE_SCHEMA = {
   type: 'object',
   additionalProperties: false,
@@ -188,13 +162,6 @@ const TOOL_REPAIR_RESPONSE_SCHEMA = {
       description: 'Must be an empty string. Do not repeat the original answer.',
     },
   },
-}
-
-/** Return only values required by the official Codex CLI process. */
-export function sanitizedEnvironment(source = process.env) {
-  return Object.fromEntries(
-    Object.entries(source).filter(([key, value]) => SAFE_ENV_KEYS.has(key.toUpperCase()) && value !== undefined),
-  )
 }
 
 function modelInfo(provider, model) {
@@ -784,10 +751,41 @@ export class CodexThreadPool {
     return this.entries.size
   }
 
+  /** Release all pooled and in-flight thread subscriptions before shutdown. */
+  async close() {
+    const entries = [...this.entries.values()]
+    this.entries.clear()
+    this.blocked.clear()
+    const disposals = entries.map((entry) => {
+      entry.invalidated = true
+      entry.blocked = false
+      return this.disposeEntry(entry)
+    })
+    await Promise.allSettled(disposals)
+  }
+
+  disposeEntry(entry) {
+    if (entry === undefined || entry.disposed) return Promise.resolve()
+    entry.disposed = true
+    if (typeof entry.thread?.unsubscribe !== 'function') return Promise.resolve()
+    try {
+      const pending = entry.thread.unsubscribe()
+      return pending === null || pending === undefined
+        ? Promise.resolve()
+        : Promise.resolve(pending).catch(() => {})
+    } catch {
+      // Thread cleanup is best effort; the app-server owns process teardown.
+      return Promise.resolve()
+    }
+  }
+
   prune() {
     const now = this.now()
     for (const [sessionId, entry] of this.entries) {
-      if (!entry.busy && now - entry.lastUsed >= this.idleMs) this.entries.delete(sessionId)
+      if (!entry.busy && now - entry.lastUsed >= this.idleMs) {
+        this.entries.delete(sessionId)
+        this.disposeEntry(entry)
+      }
     }
   }
 
@@ -802,7 +800,9 @@ export class CodexThreadPool {
         }
       }
       if (oldestId === undefined) return
+      const entry = this.entries.get(oldestId)
       this.entries.delete(oldestId)
+      this.disposeEntry(entry)
     }
   }
 
@@ -827,6 +827,8 @@ export class CodexThreadPool {
     if (entry.busy && !entry.blocked) {
       entry.blocked = true
       this.blockSession(sessionId)
+    } else if (!entry.busy) {
+      this.disposeEntry(entry)
     }
   }
 
@@ -859,11 +861,13 @@ export class CodexThreadPool {
       }
       if (!success || entry.invalidated || !entry.pooled || this.entries.get(entry.sessionId) !== entry) {
         if (!success && entry.pooled && this.entries.get(entry.sessionId) === entry) this.entries.delete(entry.sessionId)
+        this.disposeEntry(entry)
         return
       }
       if (!hasNativeThreadId(entry.thread) || !Array.isArray(blocks)) {
         entry.invalidated = true
         this.entries.delete(entry.sessionId)
+        this.disposeEntry(entry)
         return
       }
       entry.lineage = {
@@ -912,6 +916,7 @@ export class CodexThreadPool {
       } else {
         existing.invalidated = true
         this.entries.delete(sessionId)
+        this.disposeEntry(existing)
       }
     }
 
@@ -1312,6 +1317,37 @@ function attachCodexUsage(error, usage) {
   return error
 }
 
+const ERROR_PROPERTY_KEYS = [
+  'code', 'type', 'name', 'message', 'detail', 'details', 'data', 'error', 'cause', 'failure',
+  'codexErrorInfo', 'rpcError', 'httpStatusCode', 'errorCode', 'errorType', 'kind',
+  'status', 'statusCode',
+]
+const CODEX_ERROR_DISCRIMINATORS = new Set([
+  'contextWindowExceeded',
+  'httpConnectionFailed',
+  'internalServerError',
+  'responseStreamConnectionFailed',
+  'responseStreamDisconnected',
+  'responseTooManyFailedAttempts',
+  'serverOverloaded',
+  'sessionBudgetExceeded',
+  'unauthorized',
+  'usageLimitExceeded',
+])
+
+/** Include discriminated-union variant keys without traversing unbounded data. */
+function errorPropertyKeys(value) {
+  const keys = new Set(ERROR_PROPERTY_KEYS)
+  try {
+    for (const key of Object.getOwnPropertyNames(value).slice(0, 128)) {
+      if (key !== 'stack') keys.add(key)
+    }
+  } catch {
+    // Ignore objects with inaccessible or hostile property enumeration.
+  }
+  return keys
+}
+
 function errorDetails(error) {
   const details = []
   const seen = new Set()
@@ -1325,9 +1361,15 @@ function errorDetails(error) {
     }
     if (value instanceof Error) {
       if (value.name !== 'Error') add(value.name)
-      for (const key of ['code', 'type', 'message', 'detail', 'details', 'data', 'error', 'cause', 'failure']) {
-        const child = value[key]
-        if (typeof child === 'string') add(child)
+      for (const key of errorPropertyKeys(value)) {
+        let child
+        try {
+          child = value[key]
+        } catch {
+          continue
+        }
+        if (CODEX_ERROR_DISCRIMINATORS.has(key)) add(key)
+        if (typeof child === 'string' || typeof child === 'number') add(String(child))
         else if (child !== null && typeof child === 'object' && depth < 3) visit(child, depth + 1)
       }
       return
@@ -1336,9 +1378,15 @@ function errorDetails(error) {
       add(String(value))
       return
     }
-    for (const key of ['code', 'type', 'name', 'message', 'detail', 'details', 'data', 'error', 'cause', 'failure']) {
-      const child = value[key]
-      if (typeof child === 'string') add(child)
+    for (const key of errorPropertyKeys(value)) {
+      let child
+      try {
+        child = value[key]
+      } catch {
+        continue
+      }
+      if (CODEX_ERROR_DISCRIMINATORS.has(key)) add(key)
+      if (typeof child === 'string' || typeof child === 'number') add(String(child))
       else if (child !== null && typeof child === 'object' && depth < 3) visit(child, depth + 1)
     }
   }
@@ -1351,14 +1399,17 @@ function errorFields(error, fields = new Set(), seen = new Set(), depth = 0) {
     return fields
   }
   seen.add(error)
-  for (const key of ['code', 'type', 'name']) {
+  for (const key of ['code', 'type', 'name', 'errorType', 'kind']) {
     try {
-      if (typeof error[key] === 'string' && error[key].length > 0) fields.add(error[key])
+      const value = error[key]
+      if ((typeof value === 'string' || typeof value === 'number') && String(value).length > 0) {
+        fields.add(String(value))
+      }
     } catch {
       // A third-party error must not prevent classification of its safe fields.
     }
   }
-  for (const key of ['cause', 'error', 'detail', 'details', 'data', 'failure']) {
+  for (const key of errorPropertyKeys(error)) {
     try {
       const child = error[key]
       if (child !== null && typeof child === 'object') errorFields(child, fields, seen, depth + 1)
@@ -1375,12 +1426,14 @@ function errorStatus(error, seen = new Set(), depth = 0) {
   }
   seen.add(error)
   try {
-    if (Number.isInteger(error.status) && error.status >= 100 && error.status <= 599) return error.status
-    if (Number.isInteger(error.statusCode) && error.statusCode >= 100 && error.statusCode <= 599) return error.statusCode
+    for (const key of ['status', 'statusCode', 'httpStatusCode']) {
+      const candidate = Number(error[key])
+      if (Number.isInteger(candidate) && candidate >= 100 && candidate <= 599) return candidate
+    }
   } catch {
     // Continue through a nested cause when a provider error uses accessors.
   }
-  for (const key of ['cause', 'error', 'detail', 'details', 'data', 'failure']) {
+  for (const key of errorPropertyKeys(error)) {
     try {
       const status = errorStatus(error[key], seen, depth + 1)
       if (status !== undefined) return status
@@ -1389,6 +1442,18 @@ function errorStatus(error, seen = new Set(), depth = 0) {
     }
   }
   return undefined
+}
+
+function normalizedErrorToken(value) {
+  return String(value).replace(/[^a-z0-9]/gi, '').toLowerCase()
+}
+
+function hasErrorMarker(error, details, markers) {
+  const wanted = markers.map(normalizedErrorToken)
+  const fields = [...errorFields(error)].map(normalizedErrorToken)
+  if (wanted.some(marker => fields.includes(marker))) return true
+  const collapsed = normalizedErrorToken(details)
+  return wanted.some(marker => marker.length > 0 && collapsed.includes(marker))
 }
 
 const TRANSPORT_ERROR_CODES = new Set([
@@ -1432,31 +1497,79 @@ const SERVER_ERROR_CODES = new Set([
   'ERR_CHILD_PROCESS_STDIO_MAXBUFFER',
   'ERR_CODEX_PROCESS_EXIT',
   'ERR_CLI_PREMATURE_EXIT',
+  'APP_SERVER_START',
+  'APP_SERVER_ERROR',
+  'APP_SERVER_EXIT',
 ])
 
+const CODEX_RUNTIME_ERROR_CODES = new Set([
+  'CODEX_SDK',
+  'CODEX_APP_SERVER',
+  'CODEX_DISCOVERY',
+  'CODEX_QUOTA',
+])
+
+/**
+ * Codex 0.150.1 can surface an upstream empty/non-JSON body as a request
+ * parser failure. Treat only this known provider shape as transient; a
+ * regular DSH structured-output PROTOCOL failure must remain fail-closed.
+ */
+function isCodexRequestBodyParseFailure(error, details) {
+  const fields = [...errorFields(error)].map(field => field.toUpperCase())
+  const status = errorStatus(error)
+  if (status === 401 || status === 403 || status === 408 || status === 429) return false
+  if (fields.includes('PROTOCOL')) return false
+  if (/\bfailed\s+to\s+parse\s+the\s+request\s+body\s+as\s+json\s*:\s*(?:expected\s+value\b|unexpected\s+end\s+of\s+json\s+input\b|(?:empty|blank)\s+(?:response\s+)?body\b)/i.test(details)) {
+    return true
+  }
+  if (!fields.some(field => CODEX_RUNTIME_ERROR_CODES.has(field))) return false
+  if (status !== undefined) return false
+  return /\bunexpected\s+end\s+of\s+json\s+input\b/i.test(details)
+    || /\b(?:empty|blank)\s+(?:response\s+)?body\b/i.test(details)
+    || /\b(?:response|request)\s+body\s+(?:is|was)\s+empty\b/i.test(details)
+}
+
 function transientSdkCode(error, details) {
+  if (isCodexRequestBodyParseFailure(error, details)) return 'SERVER'
+  const status = errorStatus(error)
+  // A provider HTTP 4xx is not a transport retry, even when a wrapper adds a
+  // socket/timeout code. The known request-body parser shape above is the
+  // deliberate compatibility exception.
+  if (status !== undefined && status >= 400 && status < 500) {
+    return status === 408 ? 'TIMEOUT' : undefined
+  }
+  if (status !== undefined && status >= 500) return 'SERVER'
   const codes = [...errorFields(error)].map(code => code.toUpperCase())
+  if (hasErrorMarker(error, details, ['usageLimitExceeded', 'sessionBudgetExceeded'])) return 'RATE_LIMIT'
+  if (hasErrorMarker(error, details, ['unauthorized'])) return 'AUTH'
+  if (hasErrorMarker(error, details, [
+    'httpConnectionFailed',
+    'responseStreamConnectionFailed',
+    'responseStreamDisconnected',
+  ])) return 'TRANSPORT'
+  if (hasErrorMarker(error, details, [
+    'serverOverloaded',
+    'internalServerError',
+    'responseTooManyFailedAttempts',
+    '-32001',
+  ])) return 'SERVER'
   if (codes.some(code => TIMEOUT_ERROR_CODES.has(code))) return 'TIMEOUT'
   if (codes.some(code => TRANSPORT_ERROR_CODES.has(code))) return 'TRANSPORT'
   if (codes.some(code => SERVER_ERROR_CODES.has(code))) return 'SERVER'
-  const status = errorStatus(error)
-  if (status !== undefined && status >= 500) return 'SERVER'
   // A 408 is the one client error that remains explicitly retryable. Other
   // 4xx statuses are provider-side request/auth failures, so their wording
   // must not turn them into a transient transport/server classification.
-  if (status === 408) return 'TIMEOUT'
-  const clientStatus = status !== undefined && status >= 400 && status < 500
-  if (!clientStatus && /\b(?:http(?:\s+status)?(?:\s+code)?|status(?:\s+code)?|status_code|response(?:\s+status)?)\s*[:=]?\s*(?:500|502|503|504)\b/i.test(details)) {
+  if (/\b(?:http(?:\s+status)?(?:\s+code)?|status(?:\s+code)?|status_code|response(?:\s+status)?)\s*[:=]?\s*(?:500|502|503|504)\b/i.test(details)) {
     return 'SERVER'
   }
-  if (!clientStatus && /\b(?:timed?\s*out|timeout|deadline exceeded|request timeout)\b/i.test(details)) return 'TIMEOUT'
-  if (!clientStatus && /\b(?:econnreset|econnrefused|econnaborted|epipe|enet(?:down|reset|unreach)|ehost(?:down|unreach)|eai_again|socket[\s_-]?hang[\s_-]?up|socket[\s_-]?closed|closed[\s_-]?connection|connection[\s_-]?reset|connection[\s_-]?refused|connection[\s_-]?aborted|connection[\s_-]?closed)\b/i.test(details)) {
+  if (/\b(?:timed?\s*out|timeout|deadline exceeded|request timeout)\b/i.test(details)) return 'TIMEOUT'
+  if (/\b(?:econnreset|econnrefused|econnaborted|epipe|enet(?:down|reset|unreach)|ehost(?:down|unreach)|eai_again|socket[\s_-]?hang[\s_-]?up|socket[\s_-]?closed|closed[\s_-]?connection|connection[\s_-]?reset|connection[\s_-]?refused|connection[\s_-]?aborted|connection[\s_-]?closed)\b/i.test(details)) {
     return 'TRANSPORT'
   }
-  if (!clientStatus && /\b(?:bad[\s_-]?gateway|service[\s_-]?unavailable|(?:internal[\s_-]?)?server[\s_-]?error)\b/i.test(details)) {
+  if (/\b(?:bad[\s_-]?gateway|service[\s_-]?unavailable|(?:internal[\s_-]?)?server[\s_-]?error)\b/i.test(details)) {
     return 'SERVER'
   }
-  if (!clientStatus && /\b(?:premature(?:ly)?|unexpected)\s+(?:end|eof|exit)|\b(?:codex|cli|child)\s+(?:process|command)?\s*(?:exited|closed|terminated)|\b(?:cli|codex)\s+(?:premature\s+exit|exit(?:ed)?\s+prematurely)|\bprocess\s+exited\b/i.test(details)) {
+  if (/\b(?:premature(?:ly)?\s+(?:end|eof|exit)|unexpected\s+(?:end|eof|exit)\s+of\s+stream)|\b(?:codex|cli|child)\s+(?:process|command)?\s*(?:exited|closed|terminated)|\b(?:cli|codex)\s+(?:premature\s+exit|exit(?:ed)?\s+prematurely)|\bprocess\s+exited\b/i.test(details)) {
     return 'SERVER'
   }
   return undefined
@@ -1474,6 +1587,7 @@ function isCodexContextOverflow(details) {
     || /\bcontext[\s_-]?(?:window|length)[\s_-]?(?:exceeded|overflow(?:ed)?|limit[\s_-]?exceeded)\b/i.test(details)
     || /\binput\s+exceeds?\s+the\s+maximum\s+length(?:\s+of\s+\d+\s+characters?)?\b/i.test(details)
     || /\b(?:contextwindow|contextlength)(?:exceeded|overflowed|limitexceeded)(?:error)?\b/i.test(details)
+    || normalizedErrorToken(details).includes('contextwindowexceeded')
 }
 
 export function classifySdkError(error) {
@@ -1485,13 +1599,6 @@ export function classifySdkError(error) {
   const statusCode = statusFailureCode(errorStatus(error))
   if (error instanceof LlmError) {
     if (error.code === CONTEXT_WINDOW_EXCEEDED_CODE) return error
-    if (contextOverflow) {
-      const options = { cause: error }
-      for (const key of ['status', 'providerRetryAfterMs', 'requestId']) {
-        if (error.failure?.[key] !== undefined) options[key] = error.failure[key]
-      }
-      return new LlmError(message, CONTEXT_WINDOW_EXCEEDED_CODE, options)
-    }
     if (statusCode !== undefined
       && (error.code === 'CODEX_SDK' || error.code === 'CODEX_APP_SERVER' || error.code === 'CODEX_QUOTA')) {
       const options = { cause: error }
@@ -1499,6 +1606,13 @@ export function classifySdkError(error) {
         if (error.failure?.[key] !== undefined) options[key] = error.failure[key]
       }
       return new LlmError(message, statusCode, options)
+    }
+    if (contextOverflow) {
+      const options = { cause: error }
+      for (const key of ['status', 'providerRetryAfterMs', 'requestId']) {
+        if (error.failure?.[key] !== undefined) options[key] = error.failure[key]
+      }
+      return new LlmError(message, CONTEXT_WINDOW_EXCEEDED_CODE, options)
     }
     if (transientCode !== undefined
       && (error.code === 'CODEX_SDK' || error.code === 'CODEX_APP_SERVER' || error.code === 'CODEX_QUOTA')) {
@@ -1510,9 +1624,13 @@ export function classifySdkError(error) {
     }
     return error
   }
+  if (statusCode !== undefined) return new LlmError(message, statusCode, { cause: error })
   if (contextOverflow) return new LlmError(message, CONTEXT_WINDOW_EXCEEDED_CODE, { cause: error })
   if (/aborted|abort/i.test(message)) return new LlmError(message, 'ABORTED', { cause: error })
-  if (statusCode !== undefined) return new LlmError(message, statusCode, { cause: error })
+  if (hasErrorMarker(error, details, ['unauthorized'])) return new LlmError(message, 'AUTH', { cause: error })
+  if (hasErrorMarker(error, details, ['usageLimitExceeded', 'sessionBudgetExceeded'])) {
+    return new LlmError(message, 'RATE_LIMIT', { cause: error })
+  }
   if (/401|403|authentication|login/i.test(message)) return new LlmError(message, 'AUTH', { cause: error })
   if (/429|rate.?limit/i.test(message)) return new LlmError(message, 'RATE_LIMIT', { cause: error })
   for (const code of ['ABORTED', 'AUTH', 'PROTOCOL', 'RATE_LIMIT', 'CONTEXT_WINDOW_EXCEEDED']) {
@@ -1558,6 +1676,15 @@ async function runStructuredThread(thread, prompt, signal, label) {
     return { response, usage }
   } catch (error) {
     throw attachCodexUsage(classifySdkError(error), usage)
+  }
+}
+
+async function disposeCodexThread(thread) {
+  if (thread === null || thread === undefined || typeof thread.unsubscribe !== 'function') return
+  try {
+    await thread.unsubscribe()
+  } catch {
+    // Process failure already makes server-side cleanup best effort.
   }
 }
 
@@ -1612,12 +1739,18 @@ export async function prepareSegmentedCompaction(options, signal, createThread, 
       for (const [groupIndex, group] of groups.entries()) {
         if (signal?.aborted === true) throw new LlmError('Codex compaction was aborted.', 'ABORTED')
         calls += 1
-        const result = await runStructuredThread(
-          createThread(),
-          buildCompactionPrompt(options, group, 'intermediate'),
-          signal,
-          `compaction intermediate pass ${level + 1}/${groups.length} (${groupIndex + 1})`,
-        )
+        const isolatedThread = createThread()
+        let result
+        try {
+          result = await runStructuredThread(
+            isolatedThread,
+            buildCompactionPrompt(options, group, 'intermediate'),
+            signal,
+            `compaction intermediate pass ${level + 1}/${groups.length} (${groupIndex + 1})`,
+          )
+        } finally {
+          await disposeCodexThread(isolatedThread)
+        }
         usage = addCodexUsage(usage, result.usage)
         summaries.push({
           id: `summary:${level}:${groupIndex}`,
@@ -1664,103 +1797,604 @@ function compactionMeasure(fragments) {
     + JSON.stringify(fragment.metadata ?? {}).length, 0)
 }
 
-function codexAppServerRequest(method, params, {
-  signal,
-  spawnProcess = spawn,
-  timeoutMs = 30_000,
-  label = 'request',
-  code = 'CODEX_APP_SERVER',
-} = {}) {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted === true) {
-      reject(new LlmError(`Codex ${label} was aborted.`, 'ABORTED'))
-      return
+class AppServerEventQueue {
+  constructor() {
+    this.values = []
+    this.waiters = []
+    this.closed = false
+    this.failure = undefined
+  }
+
+  push(value) {
+    if (this.closed) return
+    const waiter = this.waiters.shift()
+    if (waiter === undefined) this.values.push(value)
+    else waiter.resolve({ value, done: false })
+  }
+
+  close(failure) {
+    if (this.closed) return
+    this.closed = true
+    this.failure = failure
+    this.values.length = 0
+    while (this.waiters.length > 0) {
+      const waiter = this.waiters.shift()
+      if (failure === undefined) waiter.resolve({ value: undefined, done: true })
+      else waiter.reject(failure)
     }
+  }
 
-    const child = spawnProcess(process.execPath, [
-      CODEX_CLI_PATH,
-      'app-server',
-      '--stdio',
-      '-c',
-      'forced_login_method="chatgpt"',
-    ], {
-      env: sanitizedEnvironment(),
-      stdio: ['pipe', 'pipe', 'pipe'],
-    })
-    let settled = false
-    let buffer = ''
-    let stderr = ''
-
-    const finish = (error, models) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      signal?.removeEventListener('abort', abort)
-      child.kill('SIGTERM')
-      if (error === undefined) resolve(models)
-      else reject(error)
+  next() {
+    if (this.values.length > 0) return Promise.resolve({ value: this.values.shift(), done: false })
+    if (this.closed) {
+      return this.failure === undefined
+        ? Promise.resolve({ value: undefined, done: true })
+        : Promise.reject(this.failure)
     }
-    const abort = () => finish(new LlmError(`Codex ${label} was aborted.`, 'ABORTED'))
-    const fail = (message, cause) => finish(new LlmError(message, code, { cause }))
-    const write = value => child.stdin.write(`${JSON.stringify(value)}\n`)
-    const timer = setTimeout(() => fail(`Codex ${label} timed out.`), timeoutMs)
+    return new Promise((resolve, reject) => this.waiters.push({ resolve, reject }))
+  }
 
-    signal?.addEventListener('abort', abort, { once: true })
-    child.on('error', error => fail(`Unable to start Codex ${label}: ${error.message}`, error))
-    child.stderr.setEncoding('utf8')
-    child.stderr.on('data', (chunk) => {
-      stderr = `${stderr}${chunk}`.slice(-4_000)
-    })
-    child.on('exit', (code) => {
-      if (!settled) fail(`Codex ${label} exited with code ${String(code)}.${stderr.length > 0 ? ` ${stderr.trim()}` : ''}`)
-    })
-    child.stdout.setEncoding('utf8')
-    child.stdout.on('data', (chunk) => {
-      buffer += chunk
-      while (true) {
-        const newline = buffer.indexOf('\n')
-        if (newline < 0) break
-        const line = buffer.slice(0, newline).trim()
-        buffer = buffer.slice(newline + 1)
-        if (line.length === 0) continue
-        let message
-        try {
-          message = JSON.parse(line)
-        } catch {
-          continue
-        }
-        if (message.id === 1 && message.result !== undefined) {
-          write({ id: 2, method, params })
-          continue
-        }
-        if (message.id !== 2) continue
-        if (message.error !== undefined) {
-          fail(`Codex rejected ${label}: ${message.error.message ?? 'unknown error'}`)
-          return
-        }
-        finish(undefined, message.result)
-        return
-      }
-    })
+  [Symbol.asyncIterator]() {
+    return this
+  }
+}
 
-    write({
-      id: 1,
-      method: 'initialize',
-      params: {
-        clientInfo: { name: 'dsh-codex-model-discovery', version: '0.1.0' },
-        capabilities: { experimentalApi: true },
-      },
-    })
+function appServerUsage(value) {
+  const candidates = [value?.last, value?.total, value]
+  for (const source of candidates) {
+    if (source === null || typeof source !== 'object') continue
+    const hasUsage = ['totalTokens', 'total_tokens', 'inputTokens', 'input_tokens', 'outputTokens', 'output_tokens',
+      'cachedInputTokens', 'cached_input_tokens', 'cacheWriteInputTokens', 'cache_write_input_tokens',
+      'reasoningOutputTokens', 'reasoning_output_tokens'].some(key => source[key] !== undefined)
+    if (!hasUsage) continue
+    const number = (camel, snake) => {
+      const candidate = source[camel] ?? source[snake]
+      const result = Number(candidate)
+      return Number.isFinite(result) ? Math.max(0, result) : 0
+    }
+    return {
+      input_tokens: number('inputTokens', 'input_tokens'),
+      cached_input_tokens: number('cachedInputTokens', 'cached_input_tokens'),
+      cache_write_input_tokens: number('cacheWriteInputTokens', 'cache_write_input_tokens'),
+      output_tokens: number('outputTokens', 'output_tokens'),
+      reasoning_output_tokens: number('reasoningOutputTokens', 'reasoning_output_tokens'),
+    }
+  }
+  return undefined
+}
+
+function appServerAgentMessage(item) {
+  if (item === null || typeof item !== 'object') return null
+  if (item.type !== 'agentMessage' && item.type !== 'agent_message') return null
+  const id = typeof item.id === 'string' ? item.id : ''
+  if (id.length === 0) return null
+  return {
+    type: 'agent_message',
+    id,
+    text: typeof item.text === 'string' ? item.text : '',
+  }
+}
+
+function appServerThreadParams(options = {}, { resume = false, threadId } = {}) {
+  const cwd = options.cwd ?? options.workingDirectory
+  const modelProvider = options.modelProvider ?? 'openai'
+  const networkAccess = options.networkAccessEnabled === true
+  const params = {
+    ...(resume ? { threadId } : {}),
+    ...(options.model === undefined ? {} : { model: options.model }),
+    ...(modelProvider === undefined ? {} : { modelProvider }),
+    ...(cwd === undefined ? {} : { cwd }),
+    approvalPolicy: options.approvalPolicy ?? 'never',
+    sandbox: options.sandbox ?? options.sandboxMode ?? 'read-only',
+    config: {
+      ...(options.config !== null && typeof options.config === 'object' && !Array.isArray(options.config)
+        ? options.config
+        : {}),
+      'sandbox_workspace_write.network_access': networkAccess,
+    },
+  }
+  if (!resume && options.threadSource !== undefined) params.threadSource = options.threadSource
+  return params
+}
+
+function appServerInput(input) {
+  if (typeof input === 'string') return [{ type: 'text', text: input, text_elements: [] }]
+  if (!Array.isArray(input)) return [{ type: 'text', text: String(input ?? ''), text_elements: [] }]
+  return input.map((item) => {
+    if (item?.type === 'text') return { type: 'text', text: item.text ?? '', text_elements: [] }
+    if (item?.type === 'local_image') return { type: 'localImage', path: item.path }
+    if (item?.type === 'image') return { type: 'image', url: item.url }
+    throw new LlmError(`Unsupported Codex input type: ${String(item?.type)}`, 'UNSUPPORTED_CONTENT')
   })
 }
 
+function appServerStringId(value) {
+  return typeof value === 'string' && value.length > 0 ? value : undefined
+}
+
+function appServerTurnId(params, { nestedOnly = false } = {}) {
+  if (params === null || typeof params !== 'object') return undefined
+  const nested = appServerStringId(params.turn?.id)
+  if (nested !== undefined) return nested
+  return nestedOnly ? undefined : appServerStringId(params.turnId)
+}
+
+function appServerEventTurnId(method, params) {
+  if (method === 'turn/started' || method === 'turn/completed') {
+    return appServerTurnId(params, { nestedOnly: true }) ?? appServerStringId(params?.turnId)
+  }
+  return appServerTurnId(params)
+}
+
+/** Match the v2 notification envelope before putting it on a turn queue. */
+function appServerEventMatches(method, params, threadId, turnId) {
+  if (params === null || typeof params !== 'object' || Array.isArray(params)) return false
+  if (method === 'thread/tokenUsage/updated') {
+    const eventTurnId = appServerEventTurnId(method, params)
+    return params.threadId === threadId
+      && turnId !== undefined
+      && eventTurnId !== undefined
+      && eventTurnId === turnId
+  }
+  if (method === 'turn/started' || method === 'turn/completed') {
+    const eventTurnId = appServerEventTurnId(method, params)
+    return params.threadId === threadId && eventTurnId !== undefined
+      && (turnId === undefined || eventTurnId === turnId)
+  }
+  if (method === 'item/started') {
+    const eventTurnId = appServerStringId(params.turnId)
+    return params.threadId === threadId
+      && eventTurnId !== undefined
+      && (turnId === undefined || eventTurnId === turnId)
+      && appServerStringId(params.item?.id) !== undefined
+  }
+  if (method === 'item/agentMessage/delta') {
+    const eventTurnId = appServerStringId(params.turnId)
+    return params.threadId === threadId
+      && eventTurnId !== undefined
+      && (turnId === undefined || eventTurnId === turnId)
+      && appServerStringId(params.itemId) !== undefined
+  }
+  if (method === 'item/completed') {
+    const eventTurnId = appServerStringId(params.turnId)
+    return params.threadId === threadId
+      && eventTurnId !== undefined
+      && (turnId === undefined || eventTurnId === turnId)
+      && appServerStringId(params.item?.id) !== undefined
+  }
+  if (method === 'turn/failed' || method === 'error') {
+    const eventTurnId = appServerEventTurnId(method, params)
+    return params.threadId === threadId && eventTurnId !== undefined
+      && (turnId === undefined || eventTurnId === turnId)
+  }
+  return false
+}
+
+/** Compatibility wrapper for the v2 app-server transport. */
+export class CodexAppServerClient {
+  constructor(options = {}) {
+    if (options instanceof CodexAppServerRpc || typeof options?.request === 'function') this.rpc = options
+    else if (options?.rpc instanceof CodexAppServerRpc || typeof options?.rpc?.request === 'function') this.rpc = options.rpc
+    else this.rpc = new CodexAppServerRpc({
+      ...options,
+      cliPath: options.cliPath ?? CODEX_CLI_PATH,
+      configOverrides: options.configOverrides ?? CODEX_APP_SERVER_CONFIG_OVERRIDES,
+      env: options.env ?? sanitizedEnvironment(),
+    })
+    this.threads = new Set()
+  }
+
+  get generation() {
+    return this.rpc.generation
+  }
+
+  get diagnostics() {
+    return this.rpc.diagnostics
+  }
+
+  get closed() {
+    return this.rpc.closed === true
+  }
+
+  request(method, params, options) {
+    return this.rpc.request(method, params, options)
+  }
+
+  subscribe(method, callback) {
+    return typeof this.rpc.subscribe === 'function'
+      ? this.rpc.subscribe(method, callback)
+      : () => {}
+  }
+
+  startThread(options = {}) {
+    const thread = new CodexAppServerThread(this, options)
+    this.threads.add(thread)
+    return thread
+  }
+
+  resumeThread(threadId, options = {}) {
+    const thread = new CodexAppServerThread(this, options, threadId)
+    this.threads.add(thread)
+    return thread
+  }
+
+  async close() {
+    const threads = [...this.threads]
+    this.threads.clear()
+    await Promise.allSettled(threads.map(thread => thread.unsubscribe()))
+    if (typeof this.rpc.close === 'function') await this.rpc.close()
+  }
+}
+
+/** Present the old SDK's Thread/runStreamed shape over v2 JSON-RPC events. */
+export class CodexAppServerThread {
+  constructor(client, options = {}, threadId = null) {
+    this.client = client
+    this.options = { ...options }
+    this._id = typeof threadId === 'string' && threadId.length > 0 ? threadId : null
+    // An injected thread id has not yet been associated with this client
+    // generation, so the first use must always issue thread/resume.
+    this._generation = threadId === null ? null : Symbol('unresolved-generation')
+    this._subscribed = false
+    this._subscribedGeneration = undefined
+    this._unsubscribePromise = null
+    this._released = false
+  }
+
+  get id() {
+    return this._id
+  }
+
+  async ensureThread(signal) {
+    if (this._released) throw new LlmError('Codex app-server thread has been released.', 'THREAD_RELEASED')
+    if (signal?.aborted === true) throw abortFailure('request')
+    if (this._id === null) {
+      const result = await this.client.request('thread/start', appServerThreadParams(this.options), {
+        signal,
+        timeoutMs: 30_000,
+      })
+      const id = result?.thread?.id ?? result?.threadId ?? result?.id
+      if (typeof id !== 'string' || id.length === 0) {
+        throw new LlmError('Codex app-server did not return a thread id.', 'PROTOCOL')
+      }
+      this._id = id
+      this._generation = this.client.generation
+      // v2 automatically subscribes the returned thread. There is no
+      // thread/subscribe method in the official app-server protocol.
+      this._subscribed = true
+      this._subscribedGeneration = this._generation
+      if (this._released) {
+        await this.releaseSubscription()
+        throw new LlmError('Codex app-server thread has been released.', 'THREAD_RELEASED')
+      }
+      return
+    }
+    const diagnostics = this.client.diagnostics
+    const disconnected = diagnostics !== undefined && diagnostics !== null
+      && (diagnostics.closed === true || diagnostics.pid === null || diagnostics.initialized === false)
+    if (this._generation !== this.client.generation || disconnected) {
+      const result = await this.client.request('thread/resume', appServerThreadParams(this.options, {
+        resume: true,
+        threadId: this._id,
+      }), {
+        signal,
+        timeoutMs: 30_000,
+      })
+      const id = result?.thread?.id ?? result?.threadId ?? this._id
+      if (typeof id !== 'string' || id.length === 0) {
+        throw new LlmError('Codex app-server did not return a resumed thread id.', 'PROTOCOL')
+      }
+      this._id = id
+      this._generation = this.client.generation
+      // thread/resume also creates the server-side subscription.
+      this._subscribed = true
+      this._subscribedGeneration = this._generation
+      if (this._released) {
+        await this.releaseSubscription()
+        throw new LlmError('Codex app-server thread has been released.', 'THREAD_RELEASED')
+      }
+    }
+  }
+
+  async releaseSubscription() {
+    if (!this._subscribed || this._id === null) return
+    const generation = this._subscribedGeneration
+    const threadId = this._id
+    const diagnostics = this.client.diagnostics
+    const connected = this.client.closed !== true && this.client.generation === generation
+      && (diagnostics === undefined || diagnostics === null
+        || (diagnostics.closed !== true && diagnostics.pid !== null && diagnostics.initialized !== false))
+    this._subscribed = false
+    this._subscribedGeneration = undefined
+    if (!connected) return
+    try {
+      await this.client.request('thread/unsubscribe', { threadId }, {
+        timeoutMs: 5_000,
+        allowRestart: false,
+      })
+    } catch {
+      // The process may have exited after the connection check.
+    }
+  }
+
+  /** Release this thread's server-side subscription without ever respawning. */
+  unsubscribe() {
+    if (this._unsubscribePromise !== null) return this._unsubscribePromise
+    this._released = true
+    this.client.threads?.delete(this)
+    const release = async () => {
+      await this.releaseSubscription()
+    }
+    const releasePromise = release().finally(() => {
+      // A released thread must not keep the client alive or be visited by a
+      // later close(). This also makes repeated release calls harmless.
+      this.client.threads?.delete(this)
+      if (this._unsubscribePromise === releasePromise) this._unsubscribePromise = null
+    })
+    this._unsubscribePromise = releasePromise
+    return releasePromise
+  }
+
+  async runStreamed(input, turnOptions = {}) {
+    return { events: this.runStreamedInternal(input, turnOptions) }
+  }
+
+  async *runStreamedInternal(input, turnOptions = {}) {
+    const signal = turnOptions.signal
+    if (signal?.aborted === true) throw abortFailure('request')
+    await this.ensureThread(signal)
+    const threadId = this._id
+    const queue = new AppServerEventQueue()
+    const subscriptions = []
+    let subscriptionsCleaned = false
+    let turnId
+    let aborted = false
+    let timedOut = false
+    let turnEnded = false
+    let interrupted = false
+    let streamDone = false
+    let startSettled = false
+    let startTimer = null
+    let callerFailure
+    let rejectStartFailure
+    const startFailure = new Promise((resolve, reject) => {
+      rejectStartFailure = reject
+    })
+    // The abort/timeout callbacks can run before the first await below (for
+    // example when thread/start resolves in a microtask). Mark this promise's
+    // rejection handled immediately; Promise.race still observes the original
+    // rejection and preserves its normal winner semantics.
+    void startFailure.catch(() => {})
+
+    const isConnected = () => {
+      const diagnostics = this.client.diagnostics
+      return this.client.closed !== true && (diagnostics === undefined || diagnostics === null
+        || (diagnostics.closed !== true && diagnostics.pid !== null && diagnostics.initialized !== false)
+      )
+    }
+    const sendInterruptIfNeeded = () => {
+      if ((!aborted && !timedOut) || turnId === undefined || interrupted || turnEnded || !isConnected()) return
+      interrupted = true
+      try {
+        void Promise.resolve(this.client.request('turn/interrupt', { threadId, turnId }, {
+          timeoutMs: 5_000,
+          allowRestart: false,
+        })).catch(() => {})
+      } catch {
+        // A synchronous transport failure still consumes the exactly-once
+        // interrupt attempt; the shared app-server must not be restarted.
+      }
+    }
+    const observeTurnId = (candidate) => {
+      const id = appServerStringId(candidate)
+      if (id === undefined) return false
+      if (turnId !== undefined && turnId !== id) return false
+      turnId = id
+      sendInterruptIfNeeded()
+      return true
+    }
+    const cleanupSubscriptions = () => {
+      if (subscriptionsCleaned || !streamDone || !startSettled) return
+      subscriptionsCleaned = true
+      for (const unsubscribe of subscriptions) {
+        if (typeof unsubscribe === 'function') unsubscribe()
+      }
+    }
+    const subscribe = (method) => {
+      if (typeof this.client.subscribe !== 'function') return
+      subscriptions.push(this.client.subscribe(method, params => {
+        if (!appServerEventMatches(method, params, threadId, turnId)) return
+        if (turnId === undefined) observeTurnId(appServerEventTurnId(method, params))
+        queue.push({ method, params })
+      }))
+    }
+    for (const method of [
+      'turn/started',
+      'item/started',
+      'item/agentMessage/delta',
+      'item/completed',
+      'thread/tokenUsage/updated',
+      'turn/completed',
+      'turn/failed',
+      'error',
+    ]) subscribe(method)
+    if (typeof this.client.subscribe === 'function') {
+      subscriptions.push(this.client.subscribe('crash', error => {
+        queue.close(error)
+        if (!startSettled && callerFailure === undefined) {
+          callerFailure = error
+          rejectStartFailure(error)
+        }
+      }))
+    }
+    const onAbort = () => {
+      if (callerFailure !== undefined) return
+      aborted = true
+      callerFailure = abortFailure('request')
+      sendInterruptIfNeeded()
+      queue.close(callerFailure)
+      rejectStartFailure(callerFailure)
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+
+    const textByItem = new Map()
+    let usage
+    try {
+      const params = {
+        threadId,
+        input: appServerInput(input),
+        ...(this.options.model === undefined ? {} : { model: this.options.model }),
+        ...(this.options.modelReasoningEffort === undefined
+          ? {}
+          : { effort: this.options.modelReasoningEffort }),
+        ...(this.options.cwd === undefined && this.options.workingDirectory === undefined
+          ? {}
+          : { cwd: this.options.cwd ?? this.options.workingDirectory }),
+        approvalPolicy: this.options.approvalPolicy ?? 'never',
+        sandboxPolicy: {
+          type: 'readOnly',
+          networkAccess: this.options.networkAccessEnabled === true,
+        },
+        ...(turnOptions.outputSchema === undefined ? {} : { outputSchema: turnOptions.outputSchema }),
+      }
+      const timeoutMs = turnOptions.timeoutMs ?? 30_000
+      if (typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) && timeoutMs >= 0) {
+        startTimer = setTimeout(() => {
+          if (startSettled || callerFailure !== undefined) return
+          timedOut = true
+          callerFailure = new LlmError('Codex turn start timed out.', 'TIMEOUT')
+          sendInterruptIfNeeded()
+          queue.close(callerFailure)
+          rejectStartFailure(callerFailure)
+        }, timeoutMs)
+        if (typeof startTimer.unref === 'function') startTimer.unref()
+      }
+      if (signal?.aborted === true) onAbort()
+      if (callerFailure !== undefined) throw callerFailure
+
+      let wireStart
+      try {
+        // Keep this wire request alive long enough to observe a late turn id,
+        // but never leave a permanently silent app-server request pending.
+        const requestedWireTimeout = turnOptions.wireTimeoutMs
+        const derivedWireTimeout = typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) && timeoutMs >= 0
+          ? Math.max(CODEX_TURN_START_WIRE_TIMEOUT_MS, timeoutMs + 5_000)
+          : CODEX_TURN_START_WIRE_TIMEOUT_MS
+        const wireTimeoutMs = typeof requestedWireTimeout === 'number'
+          && Number.isFinite(requestedWireTimeout)
+          && requestedWireTimeout >= 0
+          ? requestedWireTimeout
+          : derivedWireTimeout
+        wireStart = this.client.request('turn/start', params, { timeoutMs: wireTimeoutMs })
+      } catch (error) {
+        startSettled = true
+        throw error
+      }
+      const observedStart = Promise.resolve(wireStart).then(started => {
+        startSettled = true
+        const responseTurnId = appServerTurnId(started)
+        if (responseTurnId !== undefined && !observeTurnId(responseTurnId)) {
+          throw new LlmError('Codex app-server returned conflicting turn ids.', 'PROTOCOL')
+        }
+        return started
+      }, error => {
+        startSettled = true
+        throw error
+      }).finally(() => {
+        cleanupSubscriptions()
+      })
+      await Promise.race([observedStart, startFailure])
+      if (startTimer !== null) {
+        clearTimeout(startTimer)
+        startTimer = null
+      }
+      if (callerFailure !== undefined) throw callerFailure
+      if (appServerStringId(turnId) === undefined) {
+        throw new LlmError('Codex app-server did not return a turn id.', 'PROTOCOL')
+      }
+
+      for await (const event of queue) {
+        const paramsForEvent = event.params ?? {}
+        if (event.method === 'turn/started') {
+          continue
+        }
+        if (event.method === 'item/started') {
+          const item = appServerAgentMessage(paramsForEvent.item)
+          if (item !== null) textByItem.set(item.id, item.text)
+          continue
+        }
+        if (event.method === 'item/agentMessage/delta') {
+          const id = typeof paramsForEvent.itemId === 'string' ? paramsForEvent.itemId : ''
+          if (id.length === 0) continue
+          const next = `${textByItem.get(id) ?? ''}${typeof paramsForEvent.delta === 'string' ? paramsForEvent.delta : ''}`
+          textByItem.set(id, next)
+          yield { type: 'item.updated', item: { type: 'agent_message', id, text: next } }
+          continue
+        }
+        if (event.method === 'item/completed') {
+          const item = appServerAgentMessage(paramsForEvent.item)
+          if (item === null) continue
+          const text = item.text.length > 0 ? item.text : textByItem.get(item.id) ?? ''
+          textByItem.set(item.id, text)
+          yield { type: 'item.completed', item: { ...item, text } }
+          continue
+        }
+        if (event.method === 'thread/tokenUsage/updated') {
+          const nextUsage = appServerUsage(paramsForEvent.tokenUsage)
+          if (nextUsage !== undefined) usage = nextUsage
+          continue
+        }
+        if (event.method === 'error' && paramsForEvent.willRetry === true) continue
+        if (event.method === 'turn/failed' || event.method === 'error') {
+          const failure = paramsForEvent.error ?? paramsForEvent
+          yield { type: 'turn.failed', error: failure }
+          turnEnded = true
+          queue.close()
+          continue
+        }
+        if (event.method === 'turn/completed') {
+          const turn = {
+            ...(paramsForEvent.turn ?? {}),
+            status: paramsForEvent.turn?.status ?? 'completed',
+          }
+          const eventUsage = appServerUsage(paramsForEvent.usage)
+            ?? appServerUsage(paramsForEvent.turn?.usage)
+            ?? appServerUsage(paramsForEvent.tokenUsage)
+            ?? usage
+          turnEnded = true
+          if (turn.status !== 'completed') {
+            yield {
+              type: 'turn.failed',
+              error: turn.error ?? paramsForEvent.error ?? new Error(`Codex turn ended with status ${turn.status}.`),
+            }
+            queue.close()
+            continue
+          }
+          yield { type: 'turn.completed', turn, usage: eventUsage }
+          queue.close()
+        }
+      }
+    } catch (error) {
+      if (callerFailure !== undefined) throw callerFailure
+      if (aborted || signal?.aborted === true) throw abortFailure('request')
+      throw error
+    } finally {
+      streamDone = true
+      if (startTimer !== null) clearTimeout(startTimer)
+      signal?.removeEventListener('abort', onAbort)
+      cleanupSubscriptions()
+    }
+  }
+}
+
 /** Read the full visible catalog exposed to the signed-in Codex account. */
-export async function discoverCodexCatalog(signal, spawnProcess = spawn) {
-  const result = await codexAppServerRequest('model/list', { includeHidden: false, limit: 100 }, {
+export async function discoverCodexCatalog(signal, appServerClient) {
+  if (appServerClient === undefined || typeof appServerClient.request !== 'function') {
+    throw new TypeError('Codex model discovery requires the shared app-server client.')
+  }
+  const result = await appServerClient.request('model/list', { includeHidden: false, limit: 100 }, {
     signal,
-    spawnProcess,
-    label: 'model discovery',
-    code: 'CODEX_DISCOVERY',
+    timeoutMs: 30_000,
   })
   const rows = Array.isArray(result?.data) ? result.data : []
   return rows
@@ -1786,8 +2420,8 @@ export async function discoverCodexCatalog(signal, spawnProcess = spawn) {
 }
 
 /** Return discovery candidates in DSH's public model-list shape. */
-export async function discoverCodexModels(signal, spawnProcess = spawn) {
-  const catalog = await discoverCodexCatalog(signal, spawnProcess)
+export async function discoverCodexModels(signal, appServerClient) {
+  const catalog = await discoverCodexCatalog(signal, appServerClient)
   return catalog.map(model => ({
     id: model.id,
     name: model.name,
@@ -1838,13 +2472,13 @@ function quotaBucket(value, fallbackId) {
 }
 
 /** Read account rate-limit windows without exposing account identity or auth data. */
-export async function readCodexRateLimits(signal, spawnProcess = spawn) {
-  const result = await codexAppServerRequest('account/rateLimits/read', undefined, {
+export async function readCodexRateLimits(signal, appServerClient) {
+  if (appServerClient === undefined || typeof appServerClient.request !== 'function') {
+    throw new TypeError('Codex quota lookup requires the shared app-server client.')
+  }
+  const result = await appServerClient.request('account/rateLimits/read', undefined, {
     signal,
-    spawnProcess,
     timeoutMs: 15_000,
-    label: 'quota lookup',
-    code: 'CODEX_QUOTA',
   })
   const rows = result?.rateLimitsByLimitId !== null
     && typeof result?.rateLimitsByLimitId === 'object'
@@ -1877,7 +2511,7 @@ function json(res, status, value) {
   res.end(body)
 }
 
-function registerQuotaRoute(ctx) {
+function registerQuotaRoute(ctx, readQuota) {
   return ctx.webServer.register({
     kind: 'exact',
     path: `${API_ROOT}/quota`,
@@ -1887,7 +2521,7 @@ function registerQuotaRoute(ctx) {
         return
       }
       try {
-        json(res, 200, { ok: true, value: await readCodexRateLimits() })
+        json(res, 200, { ok: true, value: await readQuota() })
       } catch (error) {
         json(res, 502, { ok: false, error: error instanceof Error ? error.message : String(error) })
       }
@@ -1895,16 +2529,235 @@ function registerQuotaRoute(ctx) {
   })
 }
 
-/** DSH provider adapter backed only by the official Codex SDK and ChatGPT login. */
+const AUTH_ROUTE_ROOT = `${API_ROOT}/auth`
+const LOGIN_DEVICE_CODE_TYPE = 'chatgptDeviceCode'
+const LOGIN_CHATGPT_TYPE = 'chatgpt'
+
+function authString(value) {
+  return typeof value === 'string' && value.trim().length > 0 ? value : undefined
+}
+
+function authProtocolError(message) {
+  const error = new Error(message)
+  error.code = 'AUTH_PROTOCOL'
+  return error
+}
+
+function authConflict(message) {
+  const error = new Error(message)
+  error.code = 'AUTH_CONFLICT'
+  return error
+}
+
+/** Keep the account response deliberately smaller than the app-server shape. */
+export function sanitizeCodexAccountStatus(result) {
+  const account = result !== null && typeof result === 'object' && Object.hasOwn(result, 'account')
+    ? result.account
+    : result
+  const type = authString(account?.type)
+  const signedIn = type === LOGIN_CHATGPT_TYPE
+  return {
+    signedIn,
+    authMode: type ?? null,
+    planType: signedIn && authString(account?.planType) !== undefined
+      ? account.planType
+      : null,
+  }
+}
+
+function sanitizeLoginResponse(result, expectedType) {
+  const type = expectedType
+  const loginId = authString(result?.loginId)
+  if (loginId === undefined) throw authProtocolError('Codex login did not return a login id.')
+  if (type === LOGIN_DEVICE_CODE_TYPE) {
+    const verificationUrl = authString(result?.verificationUrl)
+    const userCode = authString(result?.userCode)
+    if (verificationUrl === undefined || userCode === undefined) {
+      throw authProtocolError('Codex device-code login returned incomplete instructions.')
+    }
+    return { type, loginId, verificationUrl, userCode }
+  }
+  const authUrl = authString(result?.authUrl)
+  if (authUrl === undefined) throw authProtocolError('Codex login did not return an authorization URL.')
+  return { type: LOGIN_CHATGPT_TYPE, loginId, authUrl }
+}
+
+/**
+ * Only a protocol-level unsupported error may switch from device-code login
+ * to the browser OAuth flow. Authentication failures and transport errors
+ * must remain visible instead of silently changing the requested flow.
+ */
+export function isUnsupportedCodexLoginError(error) {
+  const codes = [
+    error?.code,
+    error?.rpcError?.code,
+    error?.rpcError?.data?.code,
+  ]
+  if (codes.some(code => code === -32601
+    || code === 'METHOD_NOT_SUPPORTED'
+    || code === 'METHOD_NOT_FOUND'
+    || code === 'UNSUPPORTED_METHOD'
+    || code === 'UNSUPPORTED_LOGIN_TYPE'
+    || code === 'LOGIN_TYPE_NOT_SUPPORTED')) return true
+
+  const messages = [error?.message, error?.rpcError?.message]
+    .filter(value => typeof value === 'string')
+    .join(' ')
+  return /(?:method\s+(?:is\s+)?(?:not\s+supported|unsupported|not\s+found|unknown)|(?:unsupported|not\s+supported|unknown|unrecognized)\s+(?:[a-z]+\s+){0,3}(?:login\s+)?type|(?:login\s+)?type\s+(?:is\s+)?(?:unsupported|not\s+supported|unknown|unrecognized))/i.test(messages)
+}
+
+function authRequestOptions(timeoutMs) {
+  return { timeoutMs }
+}
+
+/** Own the in-memory login id so clients cannot cancel arbitrary app-server logins. */
+export class CodexAuthBridge {
+  constructor(getClient) {
+    if (typeof getClient !== 'function') throw new TypeError('CodexAuthBridge requires a client getter.')
+    this.getClient = getClient
+    this.currentLogin = undefined
+    this.loginPromise = undefined
+  }
+
+  client() {
+    const client = this.getClient()
+    if (client === undefined || client === null || typeof client.request !== 'function') {
+      throw new TypeError('Codex authentication requires the shared app-server client.')
+    }
+    return client
+  }
+
+  async status() {
+    const result = await this.client().request('account/read', { refreshToken: false }, authRequestOptions(15_000))
+    const status = sanitizeCodexAccountStatus(result)
+    if (status.signedIn) this.currentLogin = undefined
+    return status
+  }
+
+  startLogin() {
+    if (this.loginPromise !== undefined) return this.loginPromise
+    if (this.currentLogin !== undefined) return Promise.resolve(this.currentLogin.response)
+    const promise = this.#startLogin()
+    this.loginPromise = promise
+    void promise.finally(() => {
+      if (this.loginPromise === promise) this.loginPromise = undefined
+    }).catch(() => {})
+    return promise
+  }
+
+  async #startLogin() {
+    const client = this.client()
+    let result
+    let type = LOGIN_DEVICE_CODE_TYPE
+    try {
+      result = await client.request('account/login/start', { type }, authRequestOptions(30_000))
+    } catch (error) {
+      if (!isUnsupportedCodexLoginError(error)) throw error
+      type = LOGIN_CHATGPT_TYPE
+      result = await client.request('account/login/start', { type }, authRequestOptions(30_000))
+    }
+    const response = sanitizeLoginResponse(result, type)
+    this.currentLogin = { loginId: response.loginId, response }
+    return response
+  }
+
+  async cancelLogin() {
+    if (this.loginPromise !== undefined && this.currentLogin === undefined) {
+      await this.loginPromise.catch(() => {})
+    }
+    const current = this.currentLogin
+    if (current === undefined) throw authConflict('No Codex login is in progress.')
+    try {
+      await this.client().request('account/login/cancel', { loginId: current.loginId }, authRequestOptions(15_000))
+      return {}
+    } finally {
+      this.currentLogin = undefined
+    }
+  }
+
+  async logout() {
+    try {
+      await this.client().request('account/logout', undefined, authRequestOptions(15_000))
+      return {}
+    } finally {
+      this.currentLogin = undefined
+    }
+  }
+}
+
+function authHttpStatus(error) {
+  if (error?.code === 'AUTH_CONFLICT') return 409
+  if (error?.code === 'AUTH_PROTOCOL') return 502
+  return 502
+}
+
+function authErrorText(error) {
+  if (error?.code === 'AUTH_CONFLICT') return error.message
+  if (error?.code === 'AUTH_PROTOCOL') return 'Codex authentication returned an invalid response.'
+  return 'Codex authentication request failed.'
+}
+
+function registerAuthRoute(ctx, route, method, handler) {
+  return ctx.webServer.register({
+    kind: 'exact',
+    path: `${AUTH_ROUTE_ROOT}/${route}`,
+    async handler(req, res) {
+      if (req.method !== method) {
+        json(res, 405, { ok: false, error: 'method not allowed' })
+        return
+      }
+      if (method === 'POST' && req.headers?.['x-dsh-codex-auth'] !== '1') {
+        json(res, 403, { ok: false, error: 'authentication route header required' })
+        return
+      }
+      if (method === 'POST'
+        && req.headers?.['content-type']?.split(';', 1)[0]?.trim().toLowerCase() !== 'application/json') {
+        json(res, 415, { ok: false, error: 'content-type must be application/json' })
+        return
+      }
+      try {
+        json(res, 200, { ok: true, value: await handler() })
+      } catch (error) {
+        json(res, authHttpStatus(error), { ok: false, error: authErrorText(error) })
+      }
+    },
+  })
+}
+
+export function registerAuthRoutes(ctx, auth) {
+  if (auth === undefined || typeof auth.status !== 'function'
+    || typeof auth.startLogin !== 'function'
+    || typeof auth.cancelLogin !== 'function'
+    || typeof auth.logout !== 'function') {
+    throw new TypeError('registerAuthRoutes requires a CodexAuthBridge.')
+  }
+  const disposers = []
+  try {
+    disposers.push(registerAuthRoute(ctx, 'status', 'GET', () => auth.status()))
+    disposers.push(registerAuthRoute(ctx, 'login', 'POST', () => auth.startLogin()))
+    disposers.push(registerAuthRoute(ctx, 'cancel', 'POST', () => auth.cancelLogin()))
+    disposers.push(registerAuthRoute(ctx, 'logout', 'POST', () => auth.logout()))
+  } catch (error) {
+    for (const dispose of [...disposers].reverse()) dispose()
+    throw error
+  }
+  return () => {
+    for (const dispose of [...disposers].reverse()) dispose()
+  }
+}
+
+/** DSH provider adapter backed only by the official Codex app server and ChatGPT login. */
 export class CodexSubscriptionAdapter extends LlmAdapter {
-  constructor(config = {}, createClient = () => new Codex({
+  constructor(config = {}, createClient = () => new CodexAppServerClient({
+    cliPath: CODEX_CLI_PATH,
     env: sanitizedEnvironment(),
-    config: { forced_login_method: 'chatgpt' },
+    configOverrides: CODEX_APP_SERVER_CONFIG_OVERRIDES,
   }), discoverCatalog = discoverCodexCatalog, threadPool = new CodexThreadPool()) {
     super()
     this.resolveOptions = typeof config === 'function' ? config : () => config
     this.createClient = createClient
     this.discoverCatalog = discoverCatalog
+    this.sharedCatalog = discoverCatalog === discoverCodexCatalog
     this.threadPool = threadPool
     this.client = undefined
     this.liveCatalog = undefined
@@ -1926,7 +2779,9 @@ export class CodexSubscriptionAdapter extends LlmAdapter {
     if (this.catalogPromise === undefined) {
       let shared
       shared = Promise.resolve()
-        .then(() => this.discoverCatalog())
+        .then(() => this.sharedCatalog
+          ? this.discoverCatalog(undefined, this.getClient())
+          : this.discoverCatalog())
         .then((models) => {
           this.liveCatalog = (models ?? [])
             .map(normalizeCatalogModel)
@@ -1955,6 +2810,13 @@ export class CodexSubscriptionAdapter extends LlmAdapter {
     return this.client
   }
 
+  async close() {
+    const client = this.client
+    this.client = undefined
+    await this.threadPool.close()
+    if (typeof client?.close === 'function') await client.close()
+  }
+
   providerInfo(provider) {
     return { id: provider, name: 'Codex' }
   }
@@ -1979,6 +2841,16 @@ export class CodexSubscriptionAdapter extends LlmAdapter {
       byId.set(model.id, mergeCatalogModel(existing, model))
     }
     return [...byId.values()].map(model => modelInfo(provider, model))
+  }
+
+  async discoverModels(signal) {
+    const catalog = await this.catalog(signal)
+    return catalog.map(model => ({
+      id: model.id,
+      name: model.name,
+      contextWindow: model.contextWindow ?? CODEX_ADAPTER_CONTEXT_WINDOW,
+      ...(model.maxTokens === undefined ? {} : { maxTokens: model.maxTokens }),
+    }))
   }
 
   async resolveModelWithConfig(provider, modelId, signal, config) {
@@ -2036,7 +2908,6 @@ export class CodexSubscriptionAdapter extends LlmAdapter {
     const threadOptions = {
       model: options.model,
       workingDirectory: config.workingDirectory,
-      skipGitRepoCheck: true,
       sandboxMode: 'read-only',
       approvalPolicy: 'never',
       networkAccessEnabled: config.allowNetworkAccess,
@@ -2305,10 +3176,14 @@ export class CodexSubscriptionAdapter extends LlmAdapter {
 export function apply(ctx, config) {
   let current = () => config
   const adapter = new CodexSubscriptionAdapter(() => current())
-  registerQuotaRoute(ctx)
+  const disposeQuotaRoute = registerQuotaRoute(ctx, () => readCodexRateLimits(undefined, adapter.getClient()))
+  ctx.effect(() => disposeQuotaRoute, 'codex quota route')
+  const auth = new CodexAuthBridge(() => adapter.getClient())
+  const disposeAuthRoutes = registerAuthRoutes(ctx, auth)
+  ctx.effect(() => disposeAuthRoutes, 'codex auth routes')
   ctx.llm.registerModelDiscovery(
     CODEX_SETTINGS_NAMESPACE,
-    (_request, signal) => discoverCodexModels(signal),
+    request => adapter.discoverModels(request?.signal),
   )
   ctx.llm.registerAdapter([CODEX_PROVIDER], adapter)
   installSettingsSection(ctx, CODEX_SETTINGS_NAMESPACE, Config, config, {
@@ -2317,4 +3192,5 @@ export function apply(ctx, config) {
     },
     onChange() {},
   })
+  ctx.effect(() => () => adapter.close(), 'codex app-server')
 }
