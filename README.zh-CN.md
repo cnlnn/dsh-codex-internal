@@ -65,7 +65,7 @@ codex login status
 macOS/Linux：
 
 ```sh
-dsh plugin --profile web add link:/absolute/path/to/dsh-codex-internal
+dsh plugin --profile web add link:/absolute/path/to/dsh-codex-oauth
 dsh --profile web --dump-config
 dsh web
 ```
@@ -73,7 +73,7 @@ dsh web
 Windows PowerShell：
 
 ```powershell
-dsh plugin --profile web add "link:C:/absolute/path/to/dsh-codex-internal"
+dsh plugin --profile web add "link:C:/absolute/path/to/dsh-codex-oauth"
 dsh --profile web --dump-config
 dsh web
 ```
@@ -92,7 +92,7 @@ dsh web
 ## 卸载
 
 ```sh
-dsh plugin --profile web remove @local/dsh-codex-internal
+dsh plugin --profile web remove @local/dsh-codex-oauth
 ```
 
 卸载后 Bridge 和 Codex 订阅提供方会从 DSH Web Profile 中移除。本地源码仓库、Codex 登录和 Codex 自有历史保持独立。选择“退出登录”会退出同一 app-server 账号，因此也会影响同系统账号下运行的 Codex CLI。

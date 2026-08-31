@@ -22,7 +22,7 @@ export const inject = ['llm', 'webServer']
 export const CODEX_PROVIDER = 'codex'
 export const CODEX_SETTINGS_NAMESPACE = settingsNamespace('llm-codex-subscription')
 export { CODEX_APP_SERVER_CONFIG_OVERRIDES, CODEX_CLI_PATH, sanitizedEnvironment }
-const API_ROOT = '/plugins/@local/dsh-codex-internal/api'
+const API_ROOT = '/plugins/@local/dsh-codex-oauth/api'
 export const CODEX_THREAD_POOL_MAX = 8
 export const CODEX_THREAD_POOL_IDLE_MS = 30 * 60 * 1000
 /**

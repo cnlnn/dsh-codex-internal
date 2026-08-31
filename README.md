@@ -65,7 +65,7 @@ codex login status
 macOS/Linux:
 
 ```sh
-dsh plugin --profile web add link:/absolute/path/to/dsh-codex-internal
+dsh plugin --profile web add link:/absolute/path/to/dsh-codex-oauth
 dsh --profile web --dump-config
 dsh web
 ```
@@ -73,7 +73,7 @@ dsh web
 Windows PowerShell:
 
 ```powershell
-dsh plugin --profile web add "link:C:/absolute/path/to/dsh-codex-internal"
+dsh plugin --profile web add "link:C:/absolute/path/to/dsh-codex-oauth"
 dsh --profile web --dump-config
 dsh web
 ```
@@ -92,7 +92,7 @@ The Codex card also offers a directory picker, network access control, live cata
 ## Remove
 
 ```sh
-dsh plugin --profile web remove @local/dsh-codex-internal
+dsh plugin --profile web remove @local/dsh-codex-oauth
 ```
 
 Removal detaches the bridge and subscription provider from the DSH Web profile. The source checkout, Codex login, and Codex-owned history remain separate. Choosing `退出登录` signs out the shared Codex app-server account and therefore also affects Codex CLI running under the same system account.

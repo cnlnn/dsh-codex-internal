@@ -384,9 +384,9 @@ test('auth route registration rolls back partial duplicates and combined disposa
   dispose()
   assert.equal(routes.size, 0)
 
-  routes.set('/plugins/@local/dsh-codex-internal/api/auth/cancel', {})
+  routes.set('/plugins/@local/dsh-codex-oauth/api/auth/cancel', {})
   assert.throws(() => registerAuthRoutes(ctx, bridge), /duplicate route/)
-  assert.deepEqual([...routes.keys()], ['/plugins/@local/dsh-codex-internal/api/auth/cancel'])
+  assert.deepEqual([...routes.keys()], ['/plugins/@local/dsh-codex-oauth/api/auth/cancel'])
 })
 
 test('apply registers quota and auth routes as disposable effects', () => {
@@ -419,11 +419,11 @@ test('apply registers quota and auth routes as disposable effects', () => {
 
   apply(ctx, { models: [] })
   assert.deepEqual([...routes.keys()].sort(), [
-    '/plugins/@local/dsh-codex-internal/api/auth/cancel',
-    '/plugins/@local/dsh-codex-internal/api/auth/login',
-    '/plugins/@local/dsh-codex-internal/api/auth/logout',
-    '/plugins/@local/dsh-codex-internal/api/auth/status',
-    '/plugins/@local/dsh-codex-internal/api/quota',
+    '/plugins/@local/dsh-codex-oauth/api/auth/cancel',
+    '/plugins/@local/dsh-codex-oauth/api/auth/login',
+    '/plugins/@local/dsh-codex-oauth/api/auth/logout',
+    '/plugins/@local/dsh-codex-oauth/api/auth/status',
+    '/plugins/@local/dsh-codex-oauth/api/quota',
   ])
   for (const dispose of [...effects].reverse()) dispose?.()
   assert.equal(routes.size, 0)
