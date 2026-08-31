@@ -1,5 +1,5 @@
 - insert:
     - id: codex-subscription-provider
-      name: '@local/dsh-codex-oauth'
+      name: '@local/dsh-codex-adapter'
       config:
         allowNetworkAccess: false

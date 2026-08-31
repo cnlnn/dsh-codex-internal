@@ -22,7 +22,10 @@ export const inject = ['llm', 'webServer']
 export const CODEX_PROVIDER = 'codex'
 export const CODEX_SETTINGS_NAMESPACE = settingsNamespace('llm-codex-subscription')
 export { CODEX_APP_SERVER_CONFIG_OVERRIDES, CODEX_CLI_PATH, sanitizedEnvironment }
-const API_ROOT = '/plugins/@local/dsh-codex-oauth/api'
+export const CODEX_API_ROOT = '/plugins/@local/dsh-codex-adapter/api'
+/** Keep the old route mounted while an existing DSH page is still loaded. */
+export const CODEX_LEGACY_API_ROOT = '/plugins/@local/dsh-codex-oauth/api'
+const API_ROOTS = Object.freeze([CODEX_API_ROOT, CODEX_LEGACY_API_ROOT])
 export const CODEX_THREAD_POOL_MAX = 8
 export const CODEX_THREAD_POOL_IDLE_MS = 30 * 60 * 1000
 /**
@@ -41,6 +44,11 @@ export const CODEX_SAFE_PROMPT_CHAR_BUDGET = 900_000
 export const CODEX_COMPACTION_MAX_LEVELS = 8
 export const CODEX_COMPACTION_MAX_CALLS_PER_LEVEL = 32
 export const CODEX_COMPACTION_MAX_CALLS = 128
+/** Conservative request-image limits used by the DSH attachment projection. */
+export const CODEX_IMAGE_REQUEST_POLICY = Object.freeze({
+  maxPixels: 4_000_000,
+  maxBytes: 10_000_000,
+})
 
 export const DEFAULT_MODELS = [
   {
@@ -109,6 +117,7 @@ const catalogModel = z.object({
   maxTokens: z.number().step(1).min(1),
   efforts: z.array(z.string()),
   defaultEffort: z.string(),
+  inputModalities: z.array(z.string()),
 })
 
 export const Config = z.object({
@@ -117,6 +126,10 @@ export const Config = z.object({
   models: z.array(catalogModel).default([]),
 })
 
+// Keep structured tool_calls as the provider contract. DSH dispatches each
+// returned call and feeds the tool result into the next adapter turn; opting
+// into app-server dynamicTools would require callbacks and a second protocol
+// loop that cannot preserve DSH's per-step lifecycle and replay state.
 const RESPONSE_SCHEMA = {
   type: 'object',
   additionalProperties: false,
@@ -169,8 +182,18 @@ function modelInfo(provider, model) {
     provider,
     id: model.id,
     name: model.name ?? model.id,
-    inputModalities: ['text'],
+    // An explicit text-only default lets DSH project durable images before
+    // dispatch. Live Codex catalog rows can opt into native image input.
+    inputModalities: normalizeInputModalities(model.inputModalities),
   }
+}
+
+function normalizeInputModalities(value) {
+  if (!Array.isArray(value)) return ['text']
+  const modalities = [...new Set(value
+    .map(modality => String(modality).trim())
+    .filter(modality => modality === 'text' || modality === 'image'))]
+  return modalities.length > 0 ? modalities : ['text']
 }
 
 function reasoningInfo(capability) {
@@ -224,12 +247,14 @@ function normalizeCatalogModel(model) {
   if (defaultEffort !== undefined && !efforts.includes(defaultEffort)) efforts.push(defaultEffort)
   const contextWindow = positiveInteger(model.contextWindow) ?? CODEX_ADAPTER_CONTEXT_WINDOW
   const maxTokens = positiveInteger(model.maxTokens)
+  const inputModalities = normalizeInputModalities(model.inputModalities)
   return {
     ...model,
     id,
     contextWindow,
     ...(maxTokens === undefined ? {} : { maxTokens }),
     efforts,
+    inputModalities,
     ...(defaultEffort === undefined ? {} : { defaultEffort }),
   }
 }
@@ -240,7 +265,9 @@ function mergeCatalogModel(live, configured) {
   if (base === null) return null
   if (configured === undefined) return base
   const merged = { ...base }
-  for (const key of ['name', 'description', 'contextWindow', 'maxTokens', 'efforts', 'defaultEffort']) {
+  for (const key of [
+    'name', 'description', 'contextWindow', 'maxTokens', 'efforts', 'defaultEffort', 'inputModalities',
+  ]) {
     if (configured[key] !== undefined) merged[key] = configured[key]
   }
   return normalizeCatalogModel(merged)
@@ -261,6 +288,9 @@ function snapshotRuntimeConfig(config) {
     models: Object.freeze((config.models ?? []).map(model => Object.freeze({
       ...model,
       ...(Array.isArray(model.efforts) ? { efforts: Object.freeze([...model.efforts]) } : {}),
+      ...(Array.isArray(model.inputModalities)
+        ? { inputModalities: Object.freeze([...model.inputModalities]) }
+        : {}),
     }))),
   })
 }
@@ -335,10 +365,145 @@ function serializeBlock(block) {
         content: block.content.map(serializeBlock),
       }
     case 'image':
-      throw new LlmError('Codex subscription models in DSH currently accept text only.', 'UNSUPPORTED_CONTENT')
+      // The prompt carries only the durable identity and display metadata. Raw
+      // bytes are resolved separately through ctx.get('attachments') and sent
+      // as native app-server UserInput image data URLs.
+      if (block.attachment === null || typeof block.attachment !== 'object') {
+        throw new LlmError('Codex received an image block without an attachment reference.', 'UNSUPPORTED_CONTENT')
+      }
+      return {
+        type: 'image',
+        attachmentId: block.attachment.attachmentId,
+        mediaType: block.attachment.mediaType,
+        bytes: block.attachment.bytes,
+        width: block.attachment.width,
+        height: block.attachment.height,
+      }
     default:
       throw new LlmError(`Unsupported DSH content block: ${String(block.type)}`, 'UNSUPPORTED_CONTENT')
   }
+}
+
+function imageBlocksIn(content, output = []) {
+  for (const block of Array.isArray(content) ? content : []) {
+    if (block?.type === 'image') output.push(block)
+    else if (block?.type === 'tool-result') imageBlocksIn(block.content, output)
+  }
+  return output
+}
+
+function imageBlocksInMessages(messages) {
+  const blocks = []
+  for (const message of Array.isArray(messages) ? messages : []) imageBlocksIn(message?.content, blocks)
+  return blocks
+}
+
+function hasImageInput(options) {
+  return imageBlocksInMessages(options?.messages).length > 0
+}
+
+function promptMessages(options, promptOptions = {}) {
+  const messages = Array.isArray(options?.messages) ? options.messages : []
+  const messageStart = promptOptions.continuation
+    && Number.isInteger(promptOptions.messageStart)
+    && promptOptions.messageStart >= 0
+    && promptOptions.messageStart <= messages.length
+    ? promptOptions.messageStart
+    : 0
+  return messages.slice(messageStart)
+}
+
+function imageInputSupported(model) {
+  return normalizeInputModalities(model?.inputModalities).includes('image')
+}
+
+function imageProjectionFailure(message, code = 'UNSUPPORTED_CONTENT') {
+  return new LlmError(message, code)
+}
+
+function imageDataUrl(request, expectedAttachmentId) {
+  if (request === null || typeof request !== 'object') {
+    throw imageProjectionFailure('Codex attachment service returned no image request.', 'ATTACHMENT_PROJECTION_FAILED')
+  }
+  const actualAttachmentId = request.attachment?.attachmentId
+  if (actualAttachmentId !== expectedAttachmentId) {
+    throw imageProjectionFailure(
+      `Codex attachment projection changed image identity for ${String(expectedAttachmentId)}.`,
+      'ATTACHMENT_PROJECTION_FAILED',
+    )
+  }
+  const mediaType = typeof request.mediaType === 'string' ? request.mediaType : request.attachment?.mediaType
+  if (!/^image\/(?:png|jpeg|webp|gif)$/.test(mediaType ?? '')) {
+    throw imageProjectionFailure('Codex attachment service returned an unsupported image media type.', 'ATTACHMENT_PROJECTION_FAILED')
+  }
+  const data = request.data
+  if (!(data instanceof Uint8Array) && !Buffer.isBuffer(data)) {
+    throw imageProjectionFailure('Codex attachment service returned invalid image bytes.', 'ATTACHMENT_PROJECTION_FAILED')
+  }
+  if (data.byteLength === 0) {
+    throw imageProjectionFailure('Codex attachment service returned an empty image.', 'ATTACHMENT_PROJECTION_FAILED')
+  }
+  return `data:${mediaType};base64,${Buffer.from(data).toString('base64')}`
+}
+
+/**
+ * Resolve durable DSH image references in request order. Returning a string
+ * for text-only turns preserves the existing app-server compatibility shape;
+ * image-capable turns use the native UserInput array with image data URLs.
+ */
+export async function buildCodexInput(options, model, getAttachments, signal, promptOptions = {}) {
+  // A reused native thread receives only the appended DSH messages. Do not
+  // re-read or re-upload images that already belong to the earlier turn.
+  const blocks = imageBlocksInMessages(promptMessages(options, promptOptions))
+  if (blocks.length === 0) return buildCodexPrompt(options, promptOptions)
+  if (!imageInputSupported(model)) {
+    throw imageProjectionFailure(`Codex model "${model?.id ?? options?.model}" does not support image input.`)
+  }
+  let attachments
+  try {
+    attachments = typeof getAttachments === 'function' ? getAttachments() : getAttachments
+  } catch {
+    attachments = undefined
+  }
+  if (attachments === null || attachments === undefined
+    || typeof attachments.readImageRequest !== 'function') {
+    throw imageProjectionFailure(
+      'Codex image input requires the DSH attachment service; refusing to drop image content.',
+      'ATTACHMENT_SERVICE_UNAVAILABLE',
+    )
+  }
+  const images = await Promise.all(blocks.map(async (block) => {
+    const attachmentId = block.attachment?.attachmentId
+    if (typeof attachmentId !== 'string' || attachmentId.length === 0) {
+      throw imageProjectionFailure('Codex received an image block without a stable attachment id.', 'ATTACHMENT_PROJECTION_FAILED')
+    }
+    let request
+    try {
+      request = await attachments.readImageRequest(block.attachment, CODEX_IMAGE_REQUEST_POLICY, signal)
+    } catch (error) {
+      if (error?.code === 'ABORTED') throw error
+      if (signal?.aborted === true) throw abortFailure('request')
+      throw imageProjectionFailure(
+        `Codex could not read image attachment ${attachmentId}; refusing to drop image content.`,
+        'ATTACHMENT_PROJECTION_FAILED',
+      )
+    }
+    return {
+      attachmentId,
+      url: imageDataUrl(request, attachmentId),
+    }
+  }))
+  const prompt = buildCodexPrompt(options, promptOptions)
+  // The serialized payload retains nested message/tool-result order and IDs;
+  // this trailing native list follows the same traversal order one-for-one.
+  const imageInputs = images.flatMap((image, index) => [
+    {
+      type: 'text',
+      text: `\n[DSH image ${index + 1}: ${image.attachmentId}]`,
+    },
+    { type: 'image', url: image.url },
+  ])
+  return [{ type: 'text', text: prompt }, ...imageInputs]
 }
 
 function codexPayload(options) {
@@ -350,6 +515,8 @@ function codexPayload(options) {
     })),
     tools: options.tools ?? [],
     generation: {
+      // This is an instruction-level default for the structured backend, not
+      // an app-server wire limit or a claim about the model's native maximum.
       max_tokens: options.maxTokens ?? null,
     },
   }
@@ -361,7 +528,7 @@ export function buildCodexPrompt(options, { messageStart = 0, continuation = fal
   const isContinuation = continuation
     && Number.isInteger(messageStart)
     && messageStart >= 0
-    && messageStart < fullPayload.messages.length
+    && messageStart <= fullPayload.messages.length
   const payload = isContinuation
     ? {
         messages: fullPayload.messages.slice(messageStart),
@@ -1699,6 +1866,12 @@ export async function prepareSegmentedCompaction(options, signal, createThread, 
   let usage
   let calls = 0
   try {
+    if (hasImageInput(options)) {
+      throw imageProjectionFailure(
+        'Codex compaction cannot preserve image attachments yet; refusing to drop image content.',
+        'ATTACHMENT_COMPACTION_UNSUPPORTED',
+      )
+    }
     const instruction = compactionInstructionFragment(options)
     const safeBudget = Number.isSafeInteger(budget) && budget > 0
       ? budget
@@ -1875,6 +2048,30 @@ function appServerAgentMessage(item) {
   }
 }
 
+function appServerReasoningMessage(item) {
+  if (item === null || typeof item !== 'object') return null
+  if (item.type !== 'reasoning' && item.type !== 'reasoning_summary') return null
+  const id = typeof item.id === 'string' ? item.id : ''
+  if (id.length === 0) return null
+  const textOf = (value) => {
+    if (typeof value === 'string') return value
+    if (!Array.isArray(value)) return ''
+    return value.map(part => typeof part === 'string'
+      ? part
+      : typeof part?.text === 'string' ? part.text : '').join('')
+  }
+  const text = typeof item.text === 'string' && item.text.length > 0
+    ? item.text
+    : typeof item.summaryText === 'string' && item.summaryText.length > 0
+      ? item.summaryText
+      : textOf(item.summary) || textOf(item.content)
+  return {
+    type: 'reasoning',
+    id,
+    text,
+  }
+}
+
 function appServerThreadParams(options = {}, { resume = false, threadId } = {}) {
   const cwd = options.cwd ?? options.workingDirectory
   const modelProvider = options.modelProvider ?? 'openai'
@@ -1942,25 +2139,42 @@ function appServerEventMatches(method, params, threadId, turnId) {
       && (turnId === undefined || eventTurnId === turnId)
   }
   if (method === 'item/started') {
-    const eventTurnId = appServerStringId(params.turnId)
+    const eventTurnId = appServerTurnId(params)
     return params.threadId === threadId
       && eventTurnId !== undefined
       && (turnId === undefined || eventTurnId === turnId)
       && appServerStringId(params.item?.id) !== undefined
   }
   if (method === 'item/agentMessage/delta') {
-    const eventTurnId = appServerStringId(params.turnId)
+    const eventTurnId = appServerTurnId(params)
+    return params.threadId === threadId
+      && eventTurnId !== undefined
+      && (turnId === undefined || eventTurnId === turnId)
+      && appServerStringId(params.itemId) !== undefined
+  }
+  if (method === 'item/reasoning/summaryTextDelta') {
+    const eventTurnId = appServerTurnId(params)
     return params.threadId === threadId
       && eventTurnId !== undefined
       && (turnId === undefined || eventTurnId === turnId)
       && appServerStringId(params.itemId) !== undefined
   }
   if (method === 'item/completed') {
-    const eventTurnId = appServerStringId(params.turnId)
+    const eventTurnId = appServerTurnId(params)
     return params.threadId === threadId
       && eventTurnId !== undefined
       && (turnId === undefined || eventTurnId === turnId)
       && appServerStringId(params.item?.id) !== undefined
+  }
+  if (method === 'item/reasoning/summaryTextDone'
+    || method === 'item/reasoning/summaryTextCompleted'
+    || method === 'item/reasoning/summaryCompleted'
+    || method === 'item/reasoning/completed') {
+    const eventTurnId = appServerTurnId(params)
+    return params.threadId === threadId
+      && eventTurnId !== undefined
+      && (turnId === undefined || eventTurnId === turnId)
+      && appServerStringId(params.itemId || params.item?.id) !== undefined
   }
   if (method === 'turn/failed' || method === 'error') {
     const eventTurnId = appServerEventTurnId(method, params)
@@ -2212,6 +2426,11 @@ export class CodexAppServerThread {
       'turn/started',
       'item/started',
       'item/agentMessage/delta',
+      'item/reasoning/summaryTextDelta',
+      'item/reasoning/summaryTextDone',
+      'item/reasoning/summaryTextCompleted',
+      'item/reasoning/summaryCompleted',
+      'item/reasoning/completed',
       'item/completed',
       'thread/tokenUsage/updated',
       'turn/completed',
@@ -2238,6 +2457,7 @@ export class CodexAppServerThread {
     signal?.addEventListener('abort', onAbort, { once: true })
 
     const textByItem = new Map()
+    const reasoningByItem = new Map()
     let usage
     try {
       const params = {
@@ -2255,6 +2475,10 @@ export class CodexAppServerThread {
           type: 'readOnly',
           networkAccess: this.options.networkAccessEnabled === true,
         },
+        // Request public reasoning summaries from the native app-server. The
+        // adapter falls back to the legacy structured `reasoning` field only
+        // when no native reasoning item is observed.
+        summary: 'auto',
         ...(turnOptions.outputSchema === undefined ? {} : { outputSchema: turnOptions.outputSchema }),
       }
       const timeoutMs = turnOptions.timeoutMs ?? 30_000
@@ -2321,6 +2545,11 @@ export class CodexAppServerThread {
         if (event.method === 'item/started') {
           const item = appServerAgentMessage(paramsForEvent.item)
           if (item !== null) textByItem.set(item.id, item.text)
+          const reasoningItem = appServerReasoningMessage(paramsForEvent.item)
+          if (reasoningItem !== null) {
+            reasoningByItem.set(reasoningItem.id, reasoningItem.text)
+            yield { type: 'item.updated', item: reasoningItem }
+          }
           continue
         }
         if (event.method === 'item/agentMessage/delta') {
@@ -2331,7 +2560,47 @@ export class CodexAppServerThread {
           yield { type: 'item.updated', item: { type: 'agent_message', id, text: next } }
           continue
         }
+        if (event.method === 'item/reasoning/summaryTextDelta') {
+          const id = typeof paramsForEvent.itemId === 'string' ? paramsForEvent.itemId : ''
+          if (id.length === 0) continue
+          const next = `${reasoningByItem.get(id) ?? ''}${typeof paramsForEvent.delta === 'string' ? paramsForEvent.delta : ''}`
+          reasoningByItem.set(id, next)
+          yield { type: 'item.updated', item: { type: 'reasoning', id, text: next } }
+          continue
+        }
+        if (event.method === 'item/reasoning/summaryTextDone'
+          || event.method === 'item/reasoning/summaryTextCompleted'
+          || event.method === 'item/reasoning/summaryCompleted'
+          || event.method === 'item/reasoning/completed') {
+          const id = typeof paramsForEvent.itemId === 'string'
+            ? paramsForEvent.itemId
+            : typeof paramsForEvent.item?.id === 'string' ? paramsForEvent.item.id : ''
+          if (id.length === 0) continue
+          const item = appServerReasoningMessage(paramsForEvent.item)
+            ?? appServerReasoningMessage({
+              type: 'reasoning',
+              id,
+              text: paramsForEvent.summaryText,
+              summary: paramsForEvent.summary,
+              content: paramsForEvent.content,
+            })
+          const text = typeof paramsForEvent.text === 'string' && paramsForEvent.text.length > 0
+            ? paramsForEvent.text
+            : item?.text.length > 0 ? item.text : reasoningByItem.get(id) ?? ''
+          reasoningByItem.set(id, text)
+          yield { type: 'item.completed', item: { type: 'reasoning', id, text } }
+          continue
+        }
         if (event.method === 'item/completed') {
+          const reasoningItem = appServerReasoningMessage(paramsForEvent.item)
+          if (reasoningItem !== null) {
+            const text = reasoningItem.text.length > 0
+              ? reasoningItem.text
+              : reasoningByItem.get(reasoningItem.id) ?? ''
+            reasoningByItem.set(reasoningItem.id, text)
+            yield { type: 'item.completed', item: { ...reasoningItem, text } }
+            continue
+          }
           const item = appServerAgentMessage(paramsForEvent.item)
           if (item === null) continue
           const text = item.text.length > 0 ? item.text : textByItem.get(item.id) ?? ''
@@ -2413,6 +2682,9 @@ export async function discoverCodexCatalog(signal, appServerClient) {
       ...(typeof row.defaultReasoningEffort === 'string'
         ? { defaultEffort: row.defaultReasoningEffort }
         : {}),
+      inputModalities: normalizeInputModalities(
+        row.inputModalities ?? row.input_modalities ?? row.supportedInputModalities,
+      ),
     }))
     .filter(model => model.id.length > 0
       && model.id !== 'undefined'
@@ -2512,24 +2784,34 @@ function json(res, status, value) {
 }
 
 function registerQuotaRoute(ctx, readQuota) {
-  return ctx.webServer.register({
-    kind: 'exact',
-    path: `${API_ROOT}/quota`,
-    async handler(req, res) {
-      if (req.method !== 'GET') {
-        json(res, 405, { ok: false, error: 'method not allowed' })
-        return
-      }
-      try {
-        json(res, 200, { ok: true, value: await readQuota() })
-      } catch (error) {
-        json(res, 502, { ok: false, error: error instanceof Error ? error.message : String(error) })
-      }
-    },
-  })
+  const disposers = []
+  try {
+    for (const root of API_ROOTS) {
+      disposers.push(ctx.webServer.register({
+        kind: 'exact',
+        path: `${root}/quota`,
+        async handler(req, res) {
+          if (req.method !== 'GET') {
+            json(res, 405, { ok: false, error: 'method not allowed' })
+            return
+          }
+          try {
+            json(res, 200, { ok: true, value: await readQuota() })
+          } catch (error) {
+            json(res, 502, { ok: false, error: error instanceof Error ? error.message : String(error) })
+          }
+        },
+      }))
+    }
+  } catch (error) {
+    for (const dispose of [...disposers].reverse()) dispose?.()
+    throw error
+  }
+  return () => {
+    for (const dispose of [...disposers].reverse()) dispose?.()
+  }
 }
 
-const AUTH_ROUTE_ROOT = `${API_ROOT}/auth`
 const LOGIN_DEVICE_CODE_TYPE = 'chatgptDeviceCode'
 const LOGIN_CHATGPT_TYPE = 'chatgpt'
 
@@ -2611,9 +2893,9 @@ function authRequestOptions(timeoutMs) {
 }
 
 /** Own the in-memory login id so clients cannot cancel arbitrary app-server logins. */
-export class CodexAuthBridge {
+export class CodexAuthAdapter {
   constructor(getClient) {
-    if (typeof getClient !== 'function') throw new TypeError('CodexAuthBridge requires a client getter.')
+    if (typeof getClient !== 'function') throw new TypeError('CodexAuthAdapter requires a client getter.')
     this.getClient = getClient
     this.currentLogin = undefined
     this.loginPromise = undefined
@@ -2697,16 +2979,18 @@ function authErrorText(error) {
   return 'Codex authentication request failed.'
 }
 
-function registerAuthRoute(ctx, route, method, handler) {
+function registerAuthRoute(ctx, root, route, method, handler) {
   return ctx.webServer.register({
     kind: 'exact',
-    path: `${AUTH_ROUTE_ROOT}/${route}`,
+    path: `${root}/auth/${route}`,
     async handler(req, res) {
       if (req.method !== method) {
         json(res, 405, { ok: false, error: 'method not allowed' })
         return
       }
-      if (method === 'POST' && req.headers?.['x-dsh-codex-auth'] !== '1') {
+      if (method === 'POST'
+        && req.headers?.['x-dsh-codex-adapter-auth'] !== '1'
+        && req.headers?.['x-dsh-codex-auth'] !== '1') {
         json(res, 403, { ok: false, error: 'authentication route header required' })
         return
       }
@@ -2729,14 +3013,16 @@ export function registerAuthRoutes(ctx, auth) {
     || typeof auth.startLogin !== 'function'
     || typeof auth.cancelLogin !== 'function'
     || typeof auth.logout !== 'function') {
-    throw new TypeError('registerAuthRoutes requires a CodexAuthBridge.')
+    throw new TypeError('registerAuthRoutes requires a CodexAuthAdapter.')
   }
   const disposers = []
   try {
-    disposers.push(registerAuthRoute(ctx, 'status', 'GET', () => auth.status()))
-    disposers.push(registerAuthRoute(ctx, 'login', 'POST', () => auth.startLogin()))
-    disposers.push(registerAuthRoute(ctx, 'cancel', 'POST', () => auth.cancelLogin()))
-    disposers.push(registerAuthRoute(ctx, 'logout', 'POST', () => auth.logout()))
+    for (const root of API_ROOTS) {
+      disposers.push(registerAuthRoute(ctx, root, 'status', 'GET', () => auth.status()))
+      disposers.push(registerAuthRoute(ctx, root, 'login', 'POST', () => auth.startLogin()))
+      disposers.push(registerAuthRoute(ctx, root, 'cancel', 'POST', () => auth.cancelLogin()))
+      disposers.push(registerAuthRoute(ctx, root, 'logout', 'POST', () => auth.logout()))
+    }
   } catch (error) {
     for (const dispose of [...disposers].reverse()) dispose()
     throw error
@@ -2746,19 +3032,23 @@ export function registerAuthRoutes(ctx, auth) {
   }
 }
 
+/** @deprecated Use CodexAuthAdapter; retained for callers of the pre-0.7 API. */
+export const CodexAuthBridge = CodexAuthAdapter
+
 /** DSH provider adapter backed only by the official Codex app server and ChatGPT login. */
 export class CodexSubscriptionAdapter extends LlmAdapter {
   constructor(config = {}, createClient = () => new CodexAppServerClient({
     cliPath: CODEX_CLI_PATH,
     env: sanitizedEnvironment(),
     configOverrides: CODEX_APP_SERVER_CONFIG_OVERRIDES,
-  }), discoverCatalog = discoverCodexCatalog, threadPool = new CodexThreadPool()) {
+  }), discoverCatalog = discoverCodexCatalog, threadPool = new CodexThreadPool(), getAttachments = () => undefined) {
     super()
     this.resolveOptions = typeof config === 'function' ? config : () => config
     this.createClient = createClient
     this.discoverCatalog = discoverCatalog
     this.sharedCatalog = discoverCatalog === discoverCodexCatalog
     this.threadPool = threadPool
+    this.getAttachments = typeof getAttachments === 'function' ? getAttachments : () => getAttachments
     this.client = undefined
     this.liveCatalog = undefined
     this.catalogAt = 0
@@ -2882,6 +3172,7 @@ export class CodexSubscriptionAdapter extends LlmAdapter {
       provider,
       model,
       config,
+      modelInfo,
     })
     return {
       model: modelInfo,
@@ -2905,6 +3196,12 @@ export class CodexSubscriptionAdapter extends LlmAdapter {
       throw new LlmError('Codex subscription adapter does not support stop sequences.', 'UNSUPPORTED_OPTION')
     }
 
+    // Keep acquisition ahead of model lookup. Besides preserving the adapter's
+    // existing cancellation lifecycle, this guarantees a failed validation
+    // still invalidates the thread that was created for this request.
+    let modelInfo = prepared?.modelInfo
+    const containsImage = hasImageInput(options)
+
     const threadOptions = {
       model: options.model,
       workingDirectory: config.workingDirectory,
@@ -2912,7 +3209,7 @@ export class CodexSubscriptionAdapter extends LlmAdapter {
       approvalPolicy: 'never',
       networkAccessEnabled: config.allowNetworkAccess,
       modelReasoningEffort: options.reasoningEffort,
-      threadSource: 'dsh-llm-adapter',
+      threadSource: 'dsh-codex-adapter',
     }
     const lineage = codexRequestLineage(options, threadOptions)
     const isCompaction = options.purpose === 'compaction'
@@ -2941,6 +3238,18 @@ export class CodexSubscriptionAdapter extends LlmAdapter {
     const assistantBlockMap = new Map()
 
     try {
+      modelInfo ??= await this.resolveModelWithConfig(options.provider, options.model, options.signal, config)
+      if (containsImage && options.purpose === 'compaction') {
+        // Segmented compaction currently transports text fragments only. Refuse
+        // explicitly rather than summarizing an image-free history silently.
+        throw imageProjectionFailure(
+          'Codex compaction cannot preserve image attachments yet; refusing to drop image content.',
+          'ATTACHMENT_COMPACTION_UNSUPPORTED',
+        )
+      }
+      if (containsImage && !imageInputSupported(modelInfo)) {
+        throw imageProjectionFailure(`Codex model "${options.model}" does not support image input.`)
+      }
       if (isCompaction) compactionInstructionFragment(options)
       const completePrompt = isCompaction ? buildCodexPrompt(options) : undefined
       let streamed
@@ -2956,10 +3265,17 @@ export class CodexSubscriptionAdapter extends LlmAdapter {
           signal: options.signal,
         })
       } else {
-        streamed = await lease.thread.runStreamed(completePrompt ?? buildCodexPrompt(options, {
-          messageStart: lease.messageStart,
-          continuation: lease.reused,
-        }), {
+        const input = completePrompt ?? await buildCodexInput(
+          options,
+          modelInfo,
+          this.getAttachments,
+          options.signal,
+          {
+            messageStart: lease.messageStart,
+            continuation: lease.reused,
+          },
+        )
+        streamed = await lease.thread.runStreamed(input, {
           outputSchema: RESPONSE_SCHEMA,
           signal: options.signal,
         })
@@ -2975,8 +3291,56 @@ export class CodexSubscriptionAdapter extends LlmAdapter {
       let reasoningIndex
       let textIndex
       let nextIndex = 0
+      let nativeReasoningSeen = false
+      let reasoningSource
+      const nativeReasoningByItem = new Map()
+      const nativeReasoningEmittedItems = new Set()
 
       for await (const event of streamed.events) {
+        if ((event.type === 'item.updated' || event.type === 'item.completed')
+          && event.item?.type === 'reasoning') {
+          const itemId = typeof event.item.id === 'string' ? event.item.id : ''
+          if (itemId.length === 0) continue
+          // A native summary is authoritative. If an unusual server orders a
+          // native item after legacy structured output, retain one block rather
+          // than displaying two copies of the same reasoning.
+          if (reasoningSource === 'structured') continue
+          if (reasoningEnded) continue
+          const previousItemText = nativeReasoningByItem.get(itemId)
+          const itemText = typeof event.item.text === 'string' ? event.item.text : ''
+          // An empty item/started or item/completed is only a lifecycle
+          // marker. Keep it for per-item cursor bookkeeping, but allow the
+          // structured field to remain the fallback until native text exists.
+          if (itemText.length > 0) {
+            nativeReasoningSeen = true
+            reasoningSource = 'native'
+          }
+          const firstItemEvent = previousItemText === undefined
+          nativeReasoningByItem.set(itemId, itemText)
+          // Each app-server reasoning item is append-only in the normal
+          // protocol. Keep a per-item cursor as well as the assembled DSH
+          // block so a second item beginning at offset zero is not dropped.
+          const itemDelta = firstItemEvent
+            ? itemText
+            : itemText.startsWith(previousItemText) ? itemText.slice(previousItemText.length) : itemText
+          const delta = itemDelta.length > 0
+            && !nativeReasoningEmittedItems.has(itemId)
+            && nativeReasoningEmittedItems.size > 0
+            ? `\n${itemDelta}`
+            : itemDelta
+          if (delta.length > 0) {
+            nativeReasoningEmittedItems.add(itemId)
+            if (!reasoningStarted) {
+              reasoningStarted = true
+              reasoningIndex = nextIndex
+              nextIndex += 1
+              yield { type: 'block-start', index: reasoningIndex, blockType: 'reasoning' }
+            }
+            yield { type: 'reasoning-delta', index: reasoningIndex, text: delta }
+            reasoning += delta
+          }
+          continue
+        }
         if ((event.type === 'item.updated' || event.type === 'item.completed')
           && event.item?.type === 'agent_message') {
           finalResponse = event.item.text
@@ -2984,7 +3348,8 @@ export class CodexSubscriptionAdapter extends LlmAdapter {
           const textField = partialJsonString(finalResponse, 'text')
           const nextReasoning = reasoningField.value
           const nextText = textField.value
-          if (nextReasoning.length > reasoning.length) {
+          if (!nativeReasoningSeen && reasoningSource !== 'native' && nextReasoning.length > reasoning.length) {
+            reasoningSource = 'structured'
             if (!reasoningStarted) {
               reasoningStarted = true
               reasoningIndex = nextIndex
@@ -2994,13 +3359,20 @@ export class CodexSubscriptionAdapter extends LlmAdapter {
             yield { type: 'reasoning-delta', index: reasoningIndex, text: nextReasoning.slice(reasoning.length) }
             reasoning = nextReasoning
           }
-          if (reasoningStarted && !reasoningEnded && reasoningField.complete) {
+          if (!nativeReasoningSeen && reasoningSource !== 'native'
+            && reasoningStarted && !reasoningEnded && reasoningField.complete) {
             reasoningEnded = true
             const block = { type: 'reasoning', text: reasoning }
             assistantBlockMap.set(reasoningIndex, block)
             yield { type: 'block-end', index: reasoningIndex, block }
           }
           if (nextText.length > visibleText.length) {
+            if (reasoningSource === 'native' && reasoningStarted && !reasoningEnded) {
+              reasoningEnded = true
+              const block = { type: 'reasoning', text: reasoning }
+              assistantBlockMap.set(reasoningIndex, block)
+              yield { type: 'block-end', index: reasoningIndex, block }
+            }
             if (!textStarted) {
               textStarted = true
               textIndex = nextIndex
@@ -3067,14 +3439,15 @@ export class CodexSubscriptionAdapter extends LlmAdapter {
         throw new LlmError('Codex request was aborted.', 'ABORTED')
       }
       if (responseWasRepaired) {
-        if ((reasoningEnded && response.reasoning !== reasoning)
+        if ((reasoningSource !== 'native' && reasoningEnded && response.reasoning !== reasoning)
           || (textEnded && response.text !== visibleText)
-          || !response.reasoning.startsWith(reasoning)
+          || (reasoningSource !== 'native' && !response.reasoning.startsWith(reasoning))
           || !response.text.startsWith(visibleText)) {
           throw new LlmError('Codex structured-response repair changed already emitted content.', 'PROTOCOL')
         }
       }
-      if (response.reasoning.length > reasoning.length) {
+      if (reasoningSource !== 'native' && response.reasoning.length > reasoning.length) {
+        reasoningSource = 'structured'
         if (!reasoningStarted) {
           reasoningStarted = true
           reasoningIndex = nextIndex
@@ -3093,7 +3466,10 @@ export class CodexSubscriptionAdapter extends LlmAdapter {
         yield { type: 'text-delta', index: textIndex, text: response.text.slice(visibleText.length) }
       }
       if (reasoningStarted && !reasoningEnded) {
-        const block = { type: 'reasoning', text: response.reasoning }
+        const block = {
+          type: 'reasoning',
+          text: reasoningSource === 'native' ? reasoning : response.reasoning,
+        }
         assistantBlockMap.set(reasoningIndex, block)
         yield { type: 'block-end', index: reasoningIndex, block }
       }
@@ -3175,10 +3551,22 @@ export class CodexSubscriptionAdapter extends LlmAdapter {
 
 export function apply(ctx, config) {
   let current = () => config
-  const adapter = new CodexSubscriptionAdapter(() => current())
+  const adapter = new CodexSubscriptionAdapter(
+    () => current(),
+    undefined,
+    undefined,
+    undefined,
+    () => {
+      try {
+        return typeof ctx.get === 'function' ? ctx.get('attachments') : undefined
+      } catch {
+        return undefined
+      }
+    },
+  )
   const disposeQuotaRoute = registerQuotaRoute(ctx, () => readCodexRateLimits(undefined, adapter.getClient()))
   ctx.effect(() => disposeQuotaRoute, 'codex quota route')
-  const auth = new CodexAuthBridge(() => adapter.getClient())
+  const auth = new CodexAuthAdapter(() => adapter.getClient())
   const disposeAuthRoutes = registerAuthRoutes(ctx, auth)
   ctx.effect(() => disposeAuthRoutes, 'codex auth routes')
   ctx.llm.registerModelDiscovery(

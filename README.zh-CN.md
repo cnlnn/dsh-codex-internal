@@ -1,8 +1,8 @@
-# DSH Codex OAuth Bridge
+# DSH Codex Adapter
 
 [English](README.md) | 简体中文
 
-通过图形化 OAuth Bridge，把官方 Codex ChatGPT 登录接入 DeepSeek Harness。插件将 ChatGPT 认证交给官方 Codex app-server 保管；DSH 中的第三方模型继续使用各自的原生 provider，不经过本插件。
+通过原生 DSH provider adapter，把官方 Codex ChatGPT 登录接入 DeepSeek Harness。插件将 ChatGPT 认证交给官方 Codex app-server 保管；DSH 中的第三方模型继续使用各自的原生 provider，不经过本插件。
 
 这是社区集成项目，并非 OpenAI 或 DeepSeek 官方插件。
 
@@ -17,9 +17,12 @@
 - 按模型展示可用推理强度
 - 显示当前 Codex 账号的滚动额度、剩余比例和重置时间
 - 实时增量输出文本与推理摘要，支持中止当前生成
-- 在 `设置 → 插件 → 插件配置 → Codex` 中设置工作目录、网络访问、自定义 Model ID、推理强度、上下文窗口和最大输出
+- 使用 `item/reasoning/summaryTextDelta` 原生推理摘要通知，并合并为单个 DSH reasoning block；没有原生通知时才回退到结构化 `reasoning`
+- 对实时目录 `inputModalities` 包含 `"image"` 的模型支持 DSH image block；通过 DSH attachment service 读取规范化字节，并以 app-server data URL 发送
+- 在 `设置 → 插件 → 插件配置 → Codex` 中设置工作目录、网络访问、自定义 Model ID、推理强度、上下文窗口和单次请求输出默认值
 - 普通对话直接使用 Codex，无需斜杠命令或中间模型转发
 - 原生接入 DSH 的文本、推理摘要、工具调用、结束状态和用量事件
+- 保留结构化 `tool_calls` 契约，由 DSH 负责多回合工具循环；app-server `dynamicTools` 需要另一套 callback 和 turn 生命周期，因此不跨 DSH 分步循环启用
 - 每个回合最多执行一次结构化响应或工具参数内部修复；传输、超时和 CLI 中断保留 DSH 原有重试语义
 - 自动压缩使用保守的适配器预算；超大历史会在隔离线程中按顺序完整送入分段、分层摘要流程，摘要质量取决于模型
 - 支持 Linux、macOS 和原生 Windows，覆盖 x64 与 arm64
@@ -27,6 +30,8 @@
 ## 接入方式
 
 插件使用 OpenAI 官方 `@openai/codex` app-server。ChatGPT 登录和刷新均由官方运行时负责；插件不读取或复制认证文件，不处理 API Key，也不返回账号身份。DSH 第三方模型仍由各自配置的原生 provider 处理。
+
+新的 HTTP API 位于 `/plugins/@local/dsh-codex-adapter/api`。升级期间仍会注册旧的 `/plugins/@local/dsh-codex-oauth/api/*` 兼容别名，让已经打开的旧版设置页面完成当前请求，不会瞬时失效。
 
 插件可以与 CC Switch 共存。插件启动 app-server 进程时会显式选择内置 `openai` 提供方、`chatgpt` 登录方式并关闭请求压缩，因此 CC Switch 的全局提供方和压缩设置不会改写 DSH 请求。DSH 的工作目录、网络访问、模型和推理强度仍由插件配置控制；其他 Codex 命令继续使用各自的全局设置。
 
@@ -65,7 +70,7 @@ codex login status
 macOS/Linux：
 
 ```sh
-dsh plugin --profile web add link:/absolute/path/to/dsh-codex-oauth
+dsh plugin --profile web add link:/absolute/path/to/dsh-codex-adapter
 dsh --profile web --dump-config
 dsh web
 ```
@@ -73,7 +78,7 @@ dsh web
 Windows PowerShell：
 
 ```powershell
-dsh plugin --profile web add "link:C:/absolute/path/to/dsh-codex-oauth"
+dsh plugin --profile web add "link:C:/absolute/path/to/dsh-codex-adapter"
 dsh --profile web --dump-config
 dsh web
 ```
@@ -87,15 +92,17 @@ dsh web
 3. 登录状态变为已登录后，在 DSH 标准模型选择器中刷新或选择 `Codex`。
 4. 发送普通消息。DSH 第三方 provider 继续使用各自的原生配置。
 
-该卡片还支持选择工作目录、控制网络访问、刷新实时目录和添加自定义 Model ID。自定义模型还可以设置可选推理强度、默认推理强度、上下文窗口和最大输出。全部 Bridge 和 Codex 设置都在图形界面中完成，不需要编辑 `settings.yaml`。
+该卡片还支持选择工作目录、控制网络访问、刷新实时目录、添加自定义 Model ID 和声明输入模态。自定义模型还可以设置可选推理强度、默认推理强度、上下文窗口和单次请求输出默认值。`maxTokens` 只是适配器的单次请求默认值，不是 Codex app-server 或模型的硬上限。
+
+图形编辑器固定在 `设置 → 插件 → 插件配置 → Codex`。DSH 0.1.1-rc.2 的 Models UI 没有第三方 settings namespace 的 editor，可能只显示 `settings.yaml` 提示；本适配器不调用 `registerConfigurableProviders`，不需要手动编辑 `settings.yaml`。
 
 ## 卸载
 
 ```sh
-dsh plugin --profile web remove @local/dsh-codex-oauth
+dsh plugin --profile web remove @local/dsh-codex-adapter
 ```
 
-卸载后 Bridge 和 Codex 订阅提供方会从 DSH Web Profile 中移除。本地源码仓库、Codex 登录和 Codex 自有历史保持独立。选择“退出登录”会退出同一 app-server 账号，因此也会影响同系统账号下运行的 Codex CLI。
+卸载后 Adapter 和 Codex 订阅提供方会从 DSH Web Profile 中移除。本地源码仓库、Codex 登录和 Codex 自有历史保持独立。选择“退出登录”会退出同一 app-server 账号，因此也会影响同系统账号下运行的 Codex CLI。
 
 ## 开发
 

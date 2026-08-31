@@ -1,8 +1,8 @@
-# DSH Codex OAuth Bridge
+# DSH Codex Adapter
 
 English | [简体中文](README.zh-CN.md)
 
-Connect the official Codex ChatGPT login to DeepSeek Harness through a graphical OAuth Bridge. The plugin keeps ChatGPT authentication inside the official Codex app server, while DSH's third-party models continue to use DSH's native providers.
+Connect the official Codex ChatGPT login to DeepSeek Harness through a native DSH provider adapter. The plugin keeps ChatGPT authentication inside the official Codex app server, while DSH's third-party models continue to use DSH's native providers.
 
 This is a community integration and is not an official OpenAI or DeepSeek plugin.
 
@@ -17,16 +17,21 @@ This is a community integration and is not an official OpenAI or DeepSeek plugin
 - Model-specific reasoning effort options
 - Current Codex rolling limits, remaining percentages, and reset times
 - Incremental text and reasoning-summary streaming with cancellation
-- Working directory, network access, custom Model IDs, reasoning efforts, context windows, and output limits in `Settings → Plugins → Plugin Configuration → Codex`
+- Native Codex reasoning-summary notifications (`item/reasoning/summaryTextDelta`) mapped to one DSH reasoning block, with structured `reasoning` retained only as a fallback
+- Native DSH image blocks for models whose live catalog includes `"image"` in `inputModalities`; image bytes are read through the DSH attachment service and sent as app-server data URLs
+- Working directory, network access, custom Model IDs, reasoning efforts, context windows, and per-request output defaults in `Settings → Plugins → Plugin Configuration → Codex`
 - Direct DSH conversation flow with no slash command and no intermediary model
 - DSH-native text, reasoning, tool-call, finish, and usage events
+- Structured `tool_calls` remain the adapter contract because DSH owns the multi-step tool loop; app-server `dynamicTools` would require a separate callback and turn lifecycle
 - One bounded internal repair for malformed structured responses or tool-call arguments; transient Codex transport, timeout, and CLI failures retain DSH retry semantics
 - Automatic DSH compaction uses a conservative adapter budget; oversized histories are sent as complete, ordered input segments through isolated, hierarchical passes, while summary quality depends on the model
 - Linux, macOS, and native Windows support on x64 and arm64
 
 ## Integration
 
-The bridge uses the official `@openai/codex` app server. ChatGPT authentication and refresh remain inside that runtime; the plugin does not read or copy its credential store, handle API keys, or return account identity. DSH third-party models remain on their configured native providers and are not routed through this bridge.
+The adapter uses the official `@openai/codex` app server. ChatGPT authentication and refresh remain inside that runtime; the plugin does not read or copy its credential store, handle API keys, or return account identity. DSH third-party models remain on their configured native providers and are not routed through this adapter.
+
+The canonical HTTP API is under `/plugins/@local/dsh-codex-adapter/api`. The old `/plugins/@local/dsh-codex-oauth/api/*` paths remain registered as compatibility aliases so an already-open pre-0.7 settings page can finish its current request during an upgrade.
 
 The plugin can coexist with CC Switch. Its app-server process explicitly selects the built-in `openai` provider, `chatgpt` login, and disabled request compression, so CC Switch global provider and compression settings do not reroute DSH calls. DSH working directory, network access, model, and reasoning effort remain controlled by the plugin; other Codex commands keep their own global settings.
 
@@ -65,7 +70,7 @@ codex login status
 macOS/Linux:
 
 ```sh
-dsh plugin --profile web add link:/absolute/path/to/dsh-codex-oauth
+dsh plugin --profile web add link:/absolute/path/to/dsh-codex-adapter
 dsh --profile web --dump-config
 dsh web
 ```
@@ -73,7 +78,7 @@ dsh web
 Windows PowerShell:
 
 ```powershell
-dsh plugin --profile web add "link:C:/absolute/path/to/dsh-codex-oauth"
+dsh plugin --profile web add "link:C:/absolute/path/to/dsh-codex-adapter"
 dsh --profile web --dump-config
 dsh web
 ```
@@ -87,15 +92,17 @@ The same commands work with a pinned `npx @deepseek-ai/dsh` launcher when DSH is
 3. After the status changes to signed in, refresh or select `Codex` in the standard DSH model selector.
 4. Send a regular message. DSH third-party providers continue to work through their own native configuration.
 
-The Codex card also offers a directory picker, network access control, live catalog refresh, and custom Model ID entries. Custom models can declare reasoning efforts, a default effort, a context window, and an output limit. All bridge and Codex settings are available in the UI; editing `settings.yaml` is not required.
+The Codex card also offers a directory picker, network access control, live catalog refresh, custom Model ID entries, and image input modality declarations. Custom models can declare reasoning efforts, a default effort, a context window, and a per-request output default. `maxTokens` is an adapter request default, not a hard Codex app-server/model limit.
+
+The graphical editor is intentionally located in `Settings → Plugins → Plugin Configuration → Codex`. DSH 0.1.1-rc.2's Models UI does not provide an editor for this third-party settings namespace and may show a `settings.yaml` hint; this adapter does not call `registerConfigurableProviders`, and no manual `settings.yaml` edit is required.
 
 ## Remove
 
 ```sh
-dsh plugin --profile web remove @local/dsh-codex-oauth
+dsh plugin --profile web remove @local/dsh-codex-adapter
 ```
 
-Removal detaches the bridge and subscription provider from the DSH Web profile. The source checkout, Codex login, and Codex-owned history remain separate. Choosing `退出登录` signs out the shared Codex app-server account and therefore also affects Codex CLI running under the same system account.
+Removal detaches the adapter and subscription provider from the DSH Web profile. The source checkout, Codex login, and Codex-owned history remain separate. Choosing `退出登录` signs out the shared Codex app-server account and therefore also affects Codex CLI running under the same system account.
 
 ## Development
 

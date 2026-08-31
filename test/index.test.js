@@ -7,14 +7,18 @@ import { Context } from '@deepseek-ai/cordis'
 import { LlmError, LlmRuntime } from '@deepseek-ai/dsh-llm'
 import {
   buildCodexPrompt,
+  buildCodexInput,
   buildCompactionPrompt,
   CODEX_ADAPTER_CONTEXT_WINDOW,
+  CODEX_API_ROOT,
+  CODEX_LEGACY_API_ROOT,
+  CODEX_IMAGE_REQUEST_POLICY,
   CODEX_COMPACTION_MAX_CALLS,
   CODEX_COMPACTION_MAX_CALLS_PER_LEVEL,
   CODEX_SAFE_PROMPT_CHAR_BUDGET,
   CODEX_PROVIDER,
   CodexAppServerClient,
-  CodexAuthBridge,
+  CodexAuthAdapter,
   CodexSubscriptionAdapter,
   CodexThreadPool,
   codexAssistantFingerprint,
@@ -161,7 +165,10 @@ test('account discovery drops hidden and ChatGPT-incompatible catalog rows', asy
       requests.push({ method, params, options })
       return {
         data: [
-          { model: 'gpt-5.6-sol', displayName: 'Sol', hidden: false },
+          {
+            model: 'gpt-5.6-sol', displayName: 'Sol', hidden: false,
+            inputModalities: ['text', 'image'],
+          },
           { model: 'gpt-5.2', displayName: 'Unsupported', hidden: false },
           { model: 'gpt-reserve', displayName: 'Hidden', hidden: true },
         ],
@@ -172,6 +179,7 @@ test('account discovery drops hidden and ChatGPT-incompatible catalog rows', asy
   const models = await discoverCodexCatalog(undefined, appServerClient)
   assert.deepEqual(models.map(model => model.id), ['gpt-5.6-sol'])
   assert.equal(models[0].contextWindow, CODEX_ADAPTER_CONTEXT_WINDOW)
+  assert.deepEqual(models[0].inputModalities, ['text', 'image'])
   assert.deepEqual(requests, [{
     method: 'model/list',
     params: { includeHidden: false, limit: 100 },
@@ -247,13 +255,13 @@ test('auth status exposes only ChatGPT sign-in state and plan', async () => {
   })
 
   const calls = []
-  const bridge = new CodexAuthBridge(() => ({
+  const auth = new CodexAuthAdapter(() => ({
     async request(method, params, options) {
       calls.push({ method, params, options })
       return { account: { type: 'chatgpt', email: 'must-not-return@example.test', planType: 'plus' } }
     },
   }))
-  const status = await bridge.status()
+  const status = await auth.status()
   assert.deepEqual(status, { signedIn: true, authMode: 'chatgpt', planType: 'plus' })
   assert.equal(JSON.stringify(status).includes('must-not-return'), false)
   assert.deepEqual(calls, [{
@@ -279,8 +287,8 @@ test('auth login prefers device code and falls back only for explicit unsupporte
       }
     },
   }
-  const bridge = new CodexAuthBridge(() => client)
-  const result = await bridge.startLogin()
+  const auth = new CodexAuthAdapter(() => client)
+  const result = await auth.startLogin()
   assert.deepEqual(result, {
     type: 'chatgpt',
     loginId: 'login-1',
@@ -303,9 +311,9 @@ test('auth login is shared, cancel uses only the in-memory login id, and logout 
       return {}
     },
   }
-  const bridge = new CodexAuthBridge(() => client)
-  const first = bridge.startLogin()
-  const second = bridge.startLogin()
+  const auth = new CodexAuthAdapter(() => client)
+  const first = auth.startLogin()
+  const second = auth.startLogin()
   await Promise.resolve()
   assert.equal(calls.filter(call => call.method === 'account/login/start').length, 1)
   gate.resolve({ type: 'chatgptDeviceCode', loginId: 'owned-login', verificationUrl: 'https://verify', userCode: 'ABCD-EFGH' })
@@ -313,9 +321,9 @@ test('auth login is shared, cancel uses only the in-memory login id, and logout 
     { type: 'chatgptDeviceCode', loginId: 'owned-login', verificationUrl: 'https://verify', userCode: 'ABCD-EFGH' },
     { type: 'chatgptDeviceCode', loginId: 'owned-login', verificationUrl: 'https://verify', userCode: 'ABCD-EFGH' },
   ])
-  await bridge.cancelLogin('attacker-supplied-login')
+  await auth.cancelLogin('attacker-supplied-login')
   assert.deepEqual(calls.at(-1), { method: 'account/login/cancel', params: { loginId: 'owned-login' } })
-  await bridge.logout()
+  await auth.logout()
   assert.deepEqual(calls.at(-1), { method: 'account/logout', params: undefined })
 })
 
@@ -332,9 +340,9 @@ test('auth routes enforce methods and the browser-only POST header', async () =>
       return {}
     },
   }
-  const bridge = new CodexAuthBridge(() => client)
+  const auth = new CodexAuthAdapter(() => client)
   const routes = []
-  const dispose = registerAuthRoutes({ webServer: { register(route) { routes.push(route); return () => {} } } }, bridge)
+  const dispose = registerAuthRoutes({ webServer: { register(route) { routes.push(route); return () => {} } } }, auth)
   assert.equal(typeof dispose, 'function')
 
   const statusRoute = routes.find(route => route.path.endsWith('/auth/status'))
@@ -351,12 +359,20 @@ test('auth routes enforce methods and the browser-only POST header', async () =>
   const accepted = fakeResponse()
   await loginRoute.handler({
     method: 'POST',
-    headers: { 'content-type': 'application/json; charset=utf-8', 'x-dsh-codex-auth': '1' },
+    headers: { 'content-type': 'application/json; charset=utf-8', 'x-dsh-codex-adapter-auth': '1' },
   }, accepted)
   assert.equal(accepted.statusCode, 200)
   assert.deepEqual(JSON.parse(accepted.body).value, {
     type: 'chatgptDeviceCode', loginId: 'route-login', verificationUrl: 'https://verify', userCode: 'ROUTE-CODE',
   })
+
+  const legacyLoginRoute = routes.find(route => route.path === `${CODEX_LEGACY_API_ROOT}/auth/login`)
+  const legacyAccepted = fakeResponse()
+  await legacyLoginRoute.handler({
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-dsh-codex-auth': '1' },
+  }, legacyAccepted)
+  assert.equal(legacyAccepted.statusCode, 200)
 })
 
 test('auth route registration rolls back partial duplicates and combined disposal removes all routes', () => {
@@ -377,16 +393,16 @@ test('auth route registration rolls back partial duplicates and combined disposa
       },
     },
   }
-  const bridge = new CodexAuthBridge(() => ({ request: async () => ({}) }))
-  const dispose = registerAuthRoutes(ctx, bridge)
-  assert.equal(registrations, 4)
-  assert.equal(routes.size, 4)
+  const auth = new CodexAuthAdapter(() => ({ request: async () => ({}) }))
+  const dispose = registerAuthRoutes(ctx, auth)
+  assert.equal(registrations, 8)
+  assert.equal(routes.size, 8)
   dispose()
   assert.equal(routes.size, 0)
 
-  routes.set('/plugins/@local/dsh-codex-oauth/api/auth/cancel', {})
-  assert.throws(() => registerAuthRoutes(ctx, bridge), /duplicate route/)
-  assert.deepEqual([...routes.keys()], ['/plugins/@local/dsh-codex-oauth/api/auth/cancel'])
+  routes.set(`${CODEX_LEGACY_API_ROOT}/auth/cancel`, {})
+  assert.throws(() => registerAuthRoutes(ctx, auth), /duplicate route/)
+  assert.deepEqual([...routes.keys()], [`${CODEX_LEGACY_API_ROOT}/auth/cancel`])
 })
 
 test('apply registers quota and auth routes as disposable effects', () => {
@@ -419,11 +435,16 @@ test('apply registers quota and auth routes as disposable effects', () => {
 
   apply(ctx, { models: [] })
   assert.deepEqual([...routes.keys()].sort(), [
-    '/plugins/@local/dsh-codex-oauth/api/auth/cancel',
-    '/plugins/@local/dsh-codex-oauth/api/auth/login',
-    '/plugins/@local/dsh-codex-oauth/api/auth/logout',
-    '/plugins/@local/dsh-codex-oauth/api/auth/status',
-    '/plugins/@local/dsh-codex-oauth/api/quota',
+    `${CODEX_API_ROOT}/auth/cancel`,
+    `${CODEX_API_ROOT}/auth/login`,
+    `${CODEX_API_ROOT}/auth/logout`,
+    `${CODEX_API_ROOT}/auth/status`,
+    `${CODEX_API_ROOT}/quota`,
+    `${CODEX_LEGACY_API_ROOT}/auth/cancel`,
+    `${CODEX_LEGACY_API_ROOT}/auth/login`,
+    `${CODEX_LEGACY_API_ROOT}/auth/logout`,
+    `${CODEX_LEGACY_API_ROOT}/auth/status`,
+    `${CODEX_LEGACY_API_ROOT}/quota`,
   ])
   for (const dispose of [...effects].reverse()) dispose?.()
   assert.equal(routes.size, 0)
@@ -436,6 +457,7 @@ test('adapter advertises every visible Codex account model and its reasoning eff
       name: 'GPT-5.6-Sol',
       efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
       defaultEffort: 'low',
+      inputModalities: ['text', 'image'],
     },
     {
       id: 'gpt-5.5',
@@ -456,6 +478,8 @@ test('adapter advertises every visible Codex account model and its reasoning eff
     'gpt-5.5',
   ])
   assert.ok(models.every(model => model.description === undefined))
+  assert.deepEqual(models[0].inputModalities, ['text', 'image'])
+  assert.deepEqual(models[1].inputModalities, ['text'])
   const sol = await adapter.resolveModel(CODEX_PROVIDER, 'gpt-5.6-sol')
   assert.equal(sol.reasoning.defaultEffort, 'low')
   assert.deepEqual(sol.reasoning.efforts.map(effort => effort.id), [
@@ -905,7 +929,7 @@ test('catalog shares failures and refreshes after its cache TTL', async () => {
   assert.equal(calls, 3)
 })
 
-test('app-server compatibility bridge maps v2 events, usage, and request controls', async () => {
+test('app-server adapter maps v2 events, usage, and request controls', async () => {
   const response = JSON.stringify({ reasoning: '', text: 'done', tool_calls: [] })
   const rpc = new FakeAppServerRpc((method) => {
     if (method !== 'turn/start') return undefined
@@ -1016,11 +1040,129 @@ test('app-server compatibility bridge maps v2 events, usage, and request control
     cwd: '/workspace',
     approvalPolicy: 'never',
     sandboxPolicy: { type: 'readOnly', networkAccess: true },
+    summary: 'auto',
     outputSchema,
   })
 })
 
-test('app-server compatibility bridge interrupts an active turn on abort', async () => {
+test('app-server adapter maps native reasoning deltas and completed array summaries', async () => {
+  const response = JSON.stringify({ reasoning: 'legacy fallback', text: 'done', tool_calls: [] })
+  const rpc = new FakeAppServerRpc((method) => {
+    if (method !== 'turn/start') return undefined
+    queueMicrotask(() => {
+      rpc.emit('item/reasoning/summaryTextDelta', {
+        threadId: 'thread-1', turnId: 'turn-1', itemId: 'reasoning-1', delta: 'first',
+      })
+      rpc.emit('item/reasoning/summaryTextDelta', {
+        threadId: 'thread-1', turnId: 'turn-1', itemId: 'reasoning-1', delta: ' second',
+      })
+      rpc.emit('item/completed', {
+        threadId: 'thread-1', turnId: 'turn-1',
+        item: { type: 'reasoning', id: 'reasoning-1', summary: ['first second'], content: [] },
+      })
+      // V2 completed reasoning items carry public text in summary/content
+      // arrays and may have no preceding delta notification at all.
+      rpc.emit('item/completed', {
+        threadId: 'thread-1', turnId: 'turn-1',
+        item: { type: 'reasoning', id: 'reasoning-2', summary: [], content: ['completed only'] },
+      })
+      rpc.emit('item/agentMessage/delta', {
+        threadId: 'thread-1', turnId: 'turn-1', itemId: 'item-1', delta: response,
+      })
+      rpc.emit('item/completed', {
+        threadId: 'thread-1', turnId: 'turn-1',
+        item: { type: 'agentMessage', id: 'item-1', text: response },
+      })
+      rpc.emit('turn/completed', {
+        threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' },
+      })
+    })
+    return { turn: { id: 'turn-1', status: 'inProgress' } }
+  })
+  const thread = new CodexAppServerClient({ rpc }).startThread({ model: 'gpt-5.6-sol' })
+  const streamed = await thread.runStreamed('prompt')
+  const events = await collectIterable(streamed.events)
+  assert.deepEqual(events.filter(event => event.item?.type === 'reasoning'), [
+    { type: 'item.updated', item: { type: 'reasoning', id: 'reasoning-1', text: 'first' } },
+    { type: 'item.updated', item: { type: 'reasoning', id: 'reasoning-1', text: 'first second' } },
+    { type: 'item.completed', item: { type: 'reasoning', id: 'reasoning-1', text: 'first second' } },
+    { type: 'item.completed', item: { type: 'reasoning', id: 'reasoning-2', text: 'completed only' } },
+  ])
+  assert.equal(rpc.calls.find(call => call.method === 'turn/start').params.summary, 'auto')
+})
+
+test('adapter prefers native reasoning, merges multiple items, and emits no duplicate fallback', async () => {
+  const response = JSON.stringify({ reasoning: 'legacy fallback', text: 'done', tool_calls: [] })
+  const adapter = new CodexSubscriptionAdapter({}, () => ({
+    startThread() {
+      return {
+        id: 'thread-native-reasoning',
+        async runStreamed() {
+          return {
+            events: (async function * () {
+              yield { type: 'item.updated', item: { type: 'reasoning', id: 'reasoning-empty', text: '' } }
+              yield { type: 'item.updated', item: { type: 'reasoning', id: 'reasoning-1', text: 'first' } }
+              yield { type: 'item.updated', item: { type: 'reasoning', id: 'reasoning-2', text: '' } }
+              yield { type: 'item.updated', item: { type: 'reasoning', id: 'reasoning-2', text: 'second' } }
+              yield { type: 'item.completed', item: { type: 'reasoning', id: 'reasoning-2', text: 'second' } }
+              yield { type: 'item.completed', item: { type: 'reasoning', id: 'reasoning-1', text: 'first' } }
+              yield { type: 'item.updated', item: { type: 'agent_message', id: 'message-1', text: response } }
+              yield { type: 'item.completed', item: { type: 'agent_message', id: 'message-1', text: response } }
+              yield { type: 'turn.completed' }
+            })(),
+          }
+        },
+      }
+    },
+  }))
+  const chunks = await collectStream(adapter, {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-5.6-sol',
+    sessionId: 'session-native-reasoning',
+    messages: [textMessage('user-native-reasoning', 'hello')],
+  })
+  assert.deepEqual(chunks.filter(chunk => chunk.type === 'reasoning-delta').map(chunk => chunk.text), [
+    'first', '\nsecond',
+  ])
+  assert.deepEqual(chunks.filter(chunk => chunk.type === 'block-end' && chunk.block.type === 'reasoning')
+    .map(chunk => chunk.block.text), ['first\nsecond'])
+  assert.equal(chunks.some(chunk => chunk.type === 'reasoning-delta' && chunk.text.includes('legacy')), false)
+})
+
+test('adapter falls back to structured reasoning when native items stay empty', async () => {
+  const response = JSON.stringify({ reasoning: 'structured fallback', text: 'done', tool_calls: [] })
+  const adapter = new CodexSubscriptionAdapter({}, () => ({
+    startThread() {
+      return {
+        id: 'thread-empty-reasoning',
+        async runStreamed() {
+          return {
+            events: (async function * () {
+              yield { type: 'item.updated', item: { type: 'reasoning', id: 'reasoning-empty', text: '' } }
+              yield { type: 'item.completed', item: { type: 'reasoning', id: 'reasoning-empty', text: '' } }
+              yield { type: 'item.updated', item: { type: 'agent_message', id: 'message-empty', text: response } }
+              yield { type: 'item.completed', item: { type: 'agent_message', id: 'message-empty', text: response } }
+              yield { type: 'turn.completed' }
+            })(),
+          }
+        },
+      }
+    },
+  }))
+  const chunks = await collectStream(adapter, {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-5.6-sol',
+    sessionId: 'session-empty-reasoning',
+    messages: [textMessage('user-empty-reasoning', 'hello')],
+  })
+  assert.deepEqual(chunks.filter(chunk => chunk.type === 'reasoning-delta').map(chunk => chunk.text), [
+    'structured fallback',
+  ])
+  assert.deepEqual(chunks.filter(chunk => chunk.type === 'block-end' && chunk.block.type === 'reasoning')
+    .map(chunk => chunk.block.text), ['structured fallback'])
+})
+
+test('app-server adapter interrupts an active turn on abort', async () => {
   const controller = new AbortController()
   const rpc = new FakeAppServerRpc()
   const thread = new CodexAppServerClient({ rpc }).startThread({ model: 'gpt-5.6-sol' })
@@ -1093,7 +1235,7 @@ test('strict unhandled-rejection mode handles an abort queued by thread/start', 
   assert.doesNotMatch(result.stderr, /UnhandledPromiseRejection|unhandled rejection/i)
 })
 
-test('app-server bridge keeps a late turn/start alive and interrupts once after early abort', async () => {
+test('app-server adapter keeps a late turn/start alive and interrupts once after early abort', async () => {
   const controller = new AbortController()
   const start = deferred()
   const rpc = new FakeAppServerRpc(method => method === 'turn/start' ? start.promise : undefined)
@@ -1118,7 +1260,7 @@ test('app-server bridge keeps a late turn/start alive and interrupts once after 
   assert.deepEqual(interrupts[0].params, { threadId: 'thread-1', turnId: 'turn-late' })
 })
 
-test('app-server bridge handles turn/started before a late turn/start response without duplicate interrupt', async () => {
+test('app-server adapter handles turn/started before a late turn/start response without duplicate interrupt', async () => {
   const controller = new AbortController()
   const start = deferred()
   const rpc = new FakeAppServerRpc(method => method === 'turn/start' ? start.promise : undefined)
@@ -1138,7 +1280,7 @@ test('app-server bridge handles turn/started before a late turn/start response w
   assert.equal(rpc.calls.filter(call => call.method === 'turn/interrupt').length, 1)
 })
 
-test('app-server bridge times out local turn/start promptly and interrupts a late turn', async () => {
+test('app-server adapter times out local turn/start promptly and interrupts a late turn', async () => {
   const start = deferred()
   const rpc = new FakeAppServerRpc(method => method === 'turn/start' ? start.promise : undefined)
   const thread = new CodexAppServerClient({ rpc }).startThread({ model: 'gpt-5.6-sol' })
@@ -1153,7 +1295,7 @@ test('app-server bridge times out local turn/start promptly and interrupts a lat
   assert.equal(interrupts[0].params.turnId, 'turn-timeout')
 })
 
-test('app-server compatibility bridge resumes a thread after a disconnected generation', async () => {
+test('app-server adapter resumes a thread after a disconnected generation', async () => {
   const rpc = new FakeAppServerRpc()
   const client = new CodexAppServerClient({ rpc })
   const thread = client.startThread({ model: 'gpt-5.6-sol' })
@@ -1334,6 +1476,84 @@ test('buildCodexPrompt carries the DSH system, history, and tool schemas', () =>
   assert.match(prompt, /"text":"inspect"/)
   assert.match(prompt, /"name":"read"/)
   assert.match(prompt, /Do not use your own shell/)
+})
+
+test('buildCodexInput projects ordered image attachments to native data URLs', async () => {
+  const first = {
+    attachmentId: 'sha256:first-image', mediaType: 'image/png', bytes: 3, width: 1, height: 1,
+  }
+  const second = {
+    attachmentId: 'sha256:second-image', mediaType: 'image/jpeg', bytes: 3, width: 1, height: 1,
+  }
+  const calls = []
+  const signal = new AbortController().signal
+  const attachments = {
+    async readImageRequest(ref, policy, receivedSignal) {
+      calls.push({ ref, policy, signal: receivedSignal })
+      return {
+        variantId: `variant:${ref.attachmentId}`,
+        attachment: ref,
+        data: Uint8Array.from([1, 2, 3]),
+        mediaType: ref.mediaType,
+        bytes: 3,
+        width: 1,
+        height: 1,
+        depth: 'uchar',
+        space: 'srgb',
+        hasAlpha: false,
+      }
+    },
+  }
+  const options = {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-image',
+    messages: [
+      { role: 'user', content: [{ type: 'image', attachment: first }] },
+      {
+        role: 'user',
+        content: [{
+          type: 'tool-result',
+          toolCallId: 'call-1',
+          content: [{ type: 'image', attachment: second }],
+        }],
+      },
+    ],
+  }
+  const input = await buildCodexInput(options, {
+    id: 'gpt-image',
+    inputModalities: ['text', 'image'],
+  }, attachments, signal)
+  assert.deepEqual(calls.map(call => call.ref.attachmentId), [
+    first.attachmentId, second.attachmentId,
+  ])
+  assert.ok(calls.every(call => call.policy === CODEX_IMAGE_REQUEST_POLICY && call.signal === signal))
+  assert.equal(input[1].text, `\n[DSH image 1: ${first.attachmentId}]`)
+  assert.equal(input[2].url, 'data:image/png;base64,AQID')
+  assert.equal(input[3].text, `\n[DSH image 2: ${second.attachmentId}]`)
+  assert.equal(input[4].url, 'data:image/jpeg;base64,AQID')
+  assert.match(input[0].text, new RegExp(first.attachmentId))
+  assert.match(input[0].text, new RegExp(second.attachmentId))
+})
+
+test('image projection fails closed for unsupported models and missing attachment service', async () => {
+  const options = {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-text-only',
+    messages: [{
+      role: 'user',
+      content: [{ type: 'image', attachment: {
+        attachmentId: 'sha256:image', mediaType: 'image/png', bytes: 1, width: 1, height: 1,
+      } }],
+    }],
+  }
+  await assert.rejects(
+    buildCodexInput(options, { id: options.model, inputModalities: ['text'] }, undefined),
+    error => error.code === 'UNSUPPORTED_CONTENT',
+  )
+  await assert.rejects(
+    buildCodexInput(options, { id: 'gpt-image', inputModalities: ['text', 'image'] }, undefined),
+    error => error.code === 'ATTACHMENT_SERVICE_UNAVAILABLE',
+  )
 })
 
 test('compaction source preserves message, block, and tool-result order across slices', () => {
@@ -1717,6 +1937,74 @@ test('compaction requires the final user instruction independently of message so
     { budget: 2_000 },
   )
   assert.match(result.prompt, /summarize these facts/)
+})
+
+test('adapter refuses image compaction instead of silently dropping attachments', async () => {
+  let starts = 0
+  let runs = 0
+  const image = {
+    attachmentId: 'sha256:compaction-image', mediaType: 'image/png', bytes: 1, width: 1, height: 1,
+  }
+  const adapter = new CodexSubscriptionAdapter({
+    models: [{ id: 'gpt-image', inputModalities: ['text', 'image'] }],
+  }, () => ({
+    startThread() {
+      starts += 1
+      return {
+        id: `thread-compaction-image-${starts}`,
+        async runStreamed() {
+          runs += 1
+          throw new Error('image compaction must fail before run')
+        },
+      }
+    },
+  }))
+  await assert.rejects(collectStream(adapter, {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-image',
+    purpose: 'compaction',
+    sessionId: 'session-compaction-image',
+    messages: [
+      { id: 'history', role: 'user', content: [{ type: 'image', attachment: image }] },
+      textMessage('instruction', 'summarize the history'),
+    ],
+  }), error => error.code === 'ATTACHMENT_COMPACTION_UNSUPPORTED')
+  assert.equal(starts, 1)
+  assert.equal(runs, 0)
+})
+
+test('segmented compaction rejects nested images before isolated calls', async () => {
+  const image = {
+    attachmentId: 'sha256:nested-compaction-image', mediaType: 'image/png', bytes: 1, width: 1, height: 1,
+  }
+  let calls = 0
+  const options = {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-5.6-sol',
+    purpose: 'compaction',
+    messages: [
+      textMessage('history', 'facts'),
+      {
+        id: 'tool-result',
+        role: 'user',
+        content: [{
+          type: 'tool-result',
+          toolCallId: 'call-1',
+          content: [{ type: 'image', attachment: image }],
+        }],
+      },
+      textMessage('instruction', 'summarize the history'),
+    ],
+  }
+  await assert.rejects(prepareSegmentedCompaction(
+    options,
+    new AbortController().signal,
+    () => {
+      calls += 1
+      throw new Error('nested image compaction must fail before creating a thread')
+    },
+  ), error => error.code === 'ATTACHMENT_COMPACTION_UNSUPPORTED')
+  assert.equal(calls, 0)
 })
 
 test('tool-call argument slices retain paired ids and reconstruct valid JSON', () => {
@@ -3091,6 +3379,110 @@ test('adapter sends only each new tool result across three reused turns', async 
   })
 })
 
+test('adapter projects only new images across three reused turns', async () => {
+  const prompts = []
+  const reads = []
+  let starts = 0
+  const firstImage = {
+    attachmentId: 'sha256:turn-one-image', mediaType: 'image/png', bytes: 3, width: 1, height: 1,
+  }
+  const secondImage = {
+    attachmentId: 'sha256:turn-two-image', mediaType: 'image/png', bytes: 3, width: 1, height: 1,
+  }
+  const assistantToolCall = (messageId, callId) => ({
+    id: messageId,
+    role: 'assistant',
+    content: [{ type: 'tool-call', id: callId, name: 'inspect', arguments: '{}' }],
+  })
+  const toolResult = (id, callId, image) => ({
+    id,
+    role: 'user',
+    source: { kind: 'tool', callId },
+    content: [{
+      type: 'tool-result',
+      toolCallId: callId,
+      content: image === undefined
+        ? [{ type: 'text', text: 'no image' }]
+        : [{ type: 'image', attachment: image }],
+    }],
+  })
+  const attachments = {
+    async readImageRequest(ref) {
+      reads.push(ref.attachmentId)
+      return {
+        attachment: ref,
+        data: Uint8Array.from([7, 8, 9]),
+        mediaType: ref.mediaType,
+        bytes: 3,
+        width: 1,
+        height: 1,
+      }
+    },
+  }
+  const adapter = new CodexSubscriptionAdapter({
+    models: [{ id: 'gpt-image', inputModalities: ['text', 'image'] }],
+  }, () => ({
+    startThread() {
+      starts += 1
+      let calls = 0
+      return {
+        id: `thread-image-${starts}`,
+        async runStreamed(prompt) {
+          prompts.push(prompt)
+          calls += 1
+          const response = calls < 3
+            ? JSON.stringify({
+                reasoning: '',
+                text: '',
+                tool_calls: [{ id: `call-${calls}`, name: 'inspect', arguments_json: '{}' }],
+              })
+            : JSON.stringify({ reasoning: '', text: 'done', tool_calls: [] })
+          return { events: streamedEvents([response]) }
+        },
+      }
+    },
+  }), undefined, undefined, attachments)
+  const first = {
+    provider: CODEX_PROVIDER,
+    model: 'gpt-image',
+    sessionId: 'session-three-images',
+    messages: [{
+      id: 'user-1',
+      role: 'user',
+      content: [{ type: 'image', attachment: firstImage }],
+    }],
+  }
+  const second = {
+    ...first,
+    messages: [
+      ...first.messages,
+      assistantToolCall('assistant-1', 'call-1'),
+      toolResult('tool-1', 'call-1', secondImage),
+    ],
+  }
+  const third = {
+    ...second,
+    messages: [
+      ...second.messages,
+      assistantToolCall('assistant-2', 'call-2'),
+      toolResult('tool-2', 'call-2'),
+    ],
+  }
+
+  await collectStream(adapter, first)
+  await collectStream(adapter, second)
+  await collectStream(adapter, third)
+
+  assert.equal(starts, 1)
+  assert.deepEqual(reads, [firstImage.attachmentId, secondImage.attachmentId])
+  assert.match(prompts[0][0].text, new RegExp(firstImage.attachmentId))
+  assert.match(prompts[0][2].url, /^data:image\/png;base64,/)
+  assert.match(prompts[1][0].text, new RegExp(secondImage.attachmentId))
+  assert.doesNotMatch(prompts[1][0].text, new RegExp(firstImage.attachmentId))
+  assert.doesNotMatch(prompts[2], new RegExp(firstImage.attachmentId))
+  assert.doesNotMatch(prompts[2], new RegExp(secondImage.attachmentId))
+})
+
 test('adapter invalidates a failed thread before retrying the same request', async () => {
   let starts = 0
   const adapter = new CodexSubscriptionAdapter({}, () => ({
@@ -3598,7 +3990,9 @@ test('client exposes Codex model controls in plugin configuration', async () => 
   assert.match(client, /userCode/)
   assert.match(client, /setInterval/)
   assert.match(client, /confirm/)
-  assert.match(client, /x-dsh-codex-auth/)
+  assert.match(client, /x-dsh-codex-adapter-auth/)
+  assert.match(client, /inputModalities/)
+  assert.match(client, /单次请求输出默认值/)
   assert.doesNotMatch(client, /email|auth\.json|api[_ -]?key|\btoken\b/i)
   const saveBody = client.slice(client.indexOf('const save = async'), client.indexOf('const reset = async'))
   assert.equal(saveBody.match(/\bconst models\b/g)?.length, 1)

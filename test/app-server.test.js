@@ -431,11 +431,11 @@ test('bounds an unterminated JSONL frame and fails stdout/stderr stream errors',
 	}
 })
 
-test('bridge local timeout leaves no wire request or abort listener after bounded cleanup', async () => {
+test('adapter local timeout leaves no wire request or abort listener after bounded cleanup', async () => {
 	const harness = initializeAndRespond((child, message) => {
 		if (message.method === 'thread/start') respond(child, message.id, { thread: { id: 'thread-cleanup' } })
 		if (message.method === 'thread/unsubscribe') respond(child, message.id, {})
-		// Deliberately leave turn/start unanswered. The bridge must return on
+		// Deliberately leave turn/start unanswered. The adapter must return on
 		// its local timeout, then the bounded wire timeout must clear the RPC.
 	})
 	const rpc = new CodexAppServerRpc({ spawn: harness.spawn })
